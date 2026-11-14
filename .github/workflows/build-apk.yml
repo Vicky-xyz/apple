@@ -13,6 +13,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: SonaraAndroid
     env:
       KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
     steps:
@@ -26,6 +29,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
+          build-root-directory: SonaraAndroid
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
@@ -34,7 +38,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Sonara-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: SonaraAndroid/app/build/outputs/apk/debug/*.apk
 
       # Optional: signed release APK. Runs only if you added the signing secrets.
       - name: Build signed release APK
@@ -53,12 +57,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Sonara-release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: SonaraAndroid/app/build/outputs/apk/release/*.apk
 
       - name: Attach APKs to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
+            SonaraAndroid/app/build/outputs/apk/debug/*.apk
+            SonaraAndroid/app/build/outputs/apk/release/*.apk
