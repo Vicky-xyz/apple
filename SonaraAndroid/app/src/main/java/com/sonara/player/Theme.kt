@@ -81,6 +81,7 @@ class AppSettings(ctx: Context) {
     var bass by mutableIntStateOf(sp.getInt("bass", 0)); private set
     var fadeSec by mutableIntStateOf(sp.getInt("fade", 0)); private set
     var sort by mutableIntStateOf(sp.getInt("sort", 0)); private set
+    var reactive by mutableIntStateOf(sp.getInt("reactive", 0)); private set
 
     var shuffle: Boolean = sp.getBoolean("shuffle", false)
     var repeat: Int = sp.getInt("repeat", 0)
@@ -96,6 +97,7 @@ class AppSettings(ctx: Context) {
             "bass" -> bass = v
             "fade" -> fadeSec = v
             "sort" -> sort = v
+            "reactive" -> reactive = v
         }
         sp.edit().putInt(key, v).apply()
     }

@@ -3,6 +3,7 @@ package com.sonara.player
 import android.content.Context
 import android.media.audiofx.BassBoost
 import android.media.audiofx.Equalizer
+import android.media.audiofx.Visualizer
 import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -11,6 +12,7 @@ import androidx.compose.runtime.setValue
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +21,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.pow
+import kotlin.math.sqrt
 
 /** One ExoPlayer shared by the UI and the background service, plus fade, sleep timer and audio effects. */
 object PlayerHolder {
@@ -28,6 +33,17 @@ object PlayerHolder {
     private var eqPreset = 0
     private var boostStrength = 0
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var appCtx: Context? = null
+
+    // audio-reactive visualizer
+    var vizLevels by mutableStateOf(FloatArray(32))
+    @Volatile var vizVisible = true
+    private var viz: Visualizer? = null
+    private var vizWanted = false
+    private var fft = ByteArray(0)
+    private val smooth = FloatArray(32)
+
+    fun peek(): ExoPlayer? = player
 
     var fadeMs by mutableLongStateOf(0L)
     var sleepEndAt by mutableLongStateOf(0L)
@@ -35,6 +51,7 @@ object PlayerHolder {
 
     fun get(ctx: Context): ExoPlayer {
         player?.let { return it }
+        appCtx = ctx.applicationContext
         val p = ExoPlayer.Builder(ctx.applicationContext)
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -49,9 +66,19 @@ object PlayerHolder {
         p.addListener(object : Player.Listener {
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
                 rebuildEffects()
+                rebuildVisualizer()
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                refreshWidget()
+            }
+
+            override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
+                refreshWidget()
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                refreshWidget()
                 val auto = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
                     reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
                 if (sleepAtTrackEnd && auto) {
@@ -63,6 +90,7 @@ object PlayerHolder {
         player = p
         rebuildEffects()
         scope.launch { volumeLoop(p) }
+        scope.launch { vizLoop(p) }
         return p
     }
 
@@ -85,6 +113,66 @@ object PlayerHolder {
         eqPreset = preset
         boostStrength = bass
         rebuildEffects()
+    }
+
+    private fun refreshWidget() {
+        try {
+            appCtx?.let { SonaraWidget.update(it) }
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun setVisualizer(on: Boolean) {
+        vizWanted = on
+        rebuildVisualizer()
+    }
+
+    private fun rebuildVisualizer() {
+        try { viz?.release() } catch (_: Throwable) {}
+        viz = null
+        if (!vizWanted) return
+        val p = player ?: return
+        val id = p.audioSessionId
+        if (id == C.AUDIO_SESSION_ID_UNSET) return
+        try {
+            val v = Visualizer(id)
+            val range = Visualizer.getCaptureSizeRange()
+            v.setCaptureSize(1024.coerceIn(range[0], range[1]))
+            v.setEnabled(true)
+            fft = ByteArray(v.captureSize)
+            viz = v
+        } catch (_: Throwable) {
+        }
+    }
+
+    private suspend fun vizLoop(p: ExoPlayer) {
+        val n = 32
+        while (true) {
+            delay(40)
+            val v = viz
+            if (v == null || !vizVisible || !p.isPlaying) continue
+            if (v.getFft(fft) != Visualizer.SUCCESS) continue
+            val bins = fft.size / 2
+            val usable = (bins * 0.6f).toInt().coerceAtLeast(n + 2)
+            val out = FloatArray(n)
+            for (i in 0 until n) {
+                val lo = 1 + ((usable - 1) * (i.toFloat() / n).pow(2)).toInt()
+                val hi = maxOf(lo + 1, 1 + ((usable - 1) * ((i + 1).toFloat() / n).pow(2)).toInt())
+                var sum = 0f
+                var cnt = 0
+                for (k in lo until minOf(hi, bins)) {
+                    val re = fft[2 * k].toInt().toFloat()
+                    val im = fft[2 * k + 1].toInt().toFloat()
+                    sum += hypot(re, im)
+                    cnt++
+                }
+                val mag = if (cnt > 0) sum / cnt else 0f
+                val lvl = sqrt((mag / 70f).coerceIn(0f, 1f))
+                smooth[i] = maxOf(lvl, smooth[i] * 0.82f)
+                out[i] = smooth[i]
+            }
+            vizLevels = out
+        }
     }
 
     private suspend fun volumeLoop(p: ExoPlayer) {

@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -23,6 +24,8 @@ data class Song(
 )
 
 data class LyricLine(val timeMs: Long, val text: String)
+
+data class Playlist(val id: String, val name: String, val uris: List<String>)
 
 fun Song.toMediaItem(): MediaItem = MediaItem.Builder()
     .setMediaId(uri)
@@ -170,5 +173,74 @@ object Library {
 
     fun deleteLyrics(ctx: Context, uri: String) {
         lyricFile(ctx, uri).delete()
+    }
+
+    // ----- playlists -----
+    fun loadPlaylists(ctx: Context): List<Playlist> = try {
+        val arr = JSONArray(prefs(ctx).getString("playlists", "[]"))
+        List(arr.length()) { i ->
+            val o = arr.getJSONObject(i)
+            val u = o.optJSONArray("uris") ?: JSONArray()
+            Playlist(o.getString("id"), o.optString("name", "Playlist"), List(u.length()) { j -> u.getString(j) })
+        }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    fun savePlaylists(ctx: Context, list: List<Playlist>) {
+        val arr = JSONArray()
+        list.forEach { pl ->
+            val u = JSONArray()
+            pl.uris.forEach { u.put(it) }
+            arr.put(JSONObject().put("id", pl.id).put("name", pl.name).put("uris", u))
+        }
+        prefs(ctx).edit().putString("playlists", arr.toString()).apply()
+    }
+
+    // ----- music folders -----
+    fun loadFolders(ctx: Context): List<String> = try {
+        val arr = JSONArray(prefs(ctx).getString("folders", "[]"))
+        List(arr.length()) { arr.getString(it) }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    fun saveFolders(ctx: Context, list: List<String>) {
+        prefs(ctx).edit().putString("folders", JSONArray(list).toString()).apply()
+    }
+
+    /** Recursively finds audio files inside a folder the user granted access to. */
+    fun scanTree(ctx: Context, treeUri: Uri): List<Uri> {
+        val out = mutableListOf<Uri>()
+        fun walk(docId: String, depth: Int) {
+            if (depth > 10) return
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+            try {
+                ctx.contentResolver.query(
+                    children,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE
+                    ),
+                    null, null, null
+                )?.use { c ->
+                    while (c.moveToNext()) {
+                        val id = c.getString(0)
+                        val mime = c.getString(1) ?: ""
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            walk(id, depth + 1)
+                        } else if (mime.startsWith("audio/") || mime == "application/ogg") {
+                            out.add(DocumentsContract.buildDocumentUriUsingTree(treeUri, id))
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        try {
+            walk(DocumentsContract.getTreeDocumentId(treeUri), 0)
+        } catch (_: Exception) {
+        }
+        return out
     }
 }

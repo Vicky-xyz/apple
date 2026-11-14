@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -52,6 +53,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -82,6 +84,7 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Subject
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
@@ -160,7 +163,20 @@ class MainActivity : ComponentActivity() {
         }
         PlayerHolder.fadeMs = settings.fadeSec * 1000L
         PlayerHolder.setEffects(settings.eqPreset, settings.bass)
+        if (settings.reactive == 1 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        ) PlayerHolder.setVisualizer(true)
         setContent { SonaraApp(settings, player) }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        PlayerHolder.vizVisible = true
+    }
+
+    override fun onStop() {
+        PlayerHolder.vizVisible = false
+        super.onStop()
     }
 }
 
@@ -202,7 +218,13 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
 
     var songs by remember { mutableStateOf(Library.load(ctx)) }
     var query by remember { mutableStateOf("") }
-    var favOnly by remember { mutableStateOf(false) }
+    var view by remember { mutableStateOf("all") }
+    var playlists by remember { mutableStateOf(Library.loadPlaylists(ctx)) }
+    var nameDialog by remember { mutableStateOf<String?>(null) }
+    var nameText by remember { mutableStateOf("") }
+    var addTo by remember { mutableStateOf<String?>(null) }
+    var scanStatus by remember { mutableStateOf("") }
+    var folders by remember { mutableStateOf(Library.loadFolders(ctx)) }
     var sheet by remember { mutableStateOf(Sheet.None) }
     var pos by remember { mutableLongStateOf(0L) }
     var dur by remember { mutableLongStateOf(0L) }
@@ -216,12 +238,17 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
 
     val current = songs.firstOrNull { it.uri == ui.mediaId }
 
-    val visible = remember(songs, query, favOnly, settings.sort) {
-        songs
-            .filter {
-                (!favOnly || it.fav) &&
-                    (query.isBlank() || it.title.contains(query, true) || it.artist.contains(query, true))
-            }
+    val currentPlaylist = playlists.firstOrNull { "pl:" + it.id == view }
+    val visible = remember(songs, query, view, playlists, settings.sort) {
+        val byUri = songs.associateBy { it.uri }
+        val base = when {
+            view == "fav" -> songs.filter { it.fav }
+            view.startsWith("pl:") ->
+                (playlists.firstOrNull { "pl:" + it.id == view }?.uris ?: emptyList()).mapNotNull { byUri[it] }
+            else -> songs
+        }
+        base
+            .filter { query.isBlank() || it.title.contains(query, true) || it.artist.contains(query, true) }
             .let { l ->
                 when (settings.sort) {
                     1 -> l.sortedBy { it.title.lowercase() }
@@ -261,6 +288,24 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
         Library.save(ctx, list)
     }
 
+    fun persistPl(list: List<Playlist>) {
+        playlists = list
+        Library.savePlaylists(ctx, list)
+    }
+
+    fun scanFolders(list: List<Uri>) {
+        if (list.isEmpty()) return
+        scope.launch {
+            scanStatus = "Scanning folders…"
+            val found = withContext(Dispatchers.IO) { list.flatMap { Library.scanTree(ctx, it) } }
+            val known = songs.map { it.uri }.toSet()
+            val fresh = found.filter { it.toString() !in known }.distinctBy { it.toString() }
+            val added = withContext(Dispatchers.IO) { fresh.map { Library.read(ctx, it) } }
+            persist(songs + added)
+            scanStatus = "Found ${found.size} audio files, added ${added.size} new"
+        }
+    }
+
     fun ensureService() {
         try { ctx.startService(Intent(ctx, PlaybackService::class.java)) } catch (_: Exception) {}
     }
@@ -282,10 +327,41 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
             if (player.getMediaItemAt(i).mediaId == s.uri) player.removeMediaItem(i)
         }
         Library.deleteLyrics(ctx, s.uri)
+        persistPl(playlists.map { it.copy(uris = it.uris - s.uri) })
         persist(songs.filter { it.uri != s.uri })
     }
 
     val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            try {
+                ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Exception) {
+            }
+            val list = (folders + uri.toString()).distinct()
+            folders = list
+            Library.saveFolders(ctx, list)
+            scanFolders(listOf(uri))
+        }
+    }
+
+    val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        settings.update("reactive", if (granted) 1 else 0)
+        PlayerHolder.setVisualizer(granted)
+    }
+
+    fun setReactive(on: Boolean) {
+        if (!on) {
+            settings.update("reactive", 0)
+            PlayerHolder.setVisualizer(false)
+        } else if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            settings.update("reactive", 1)
+            PlayerHolder.setVisualizer(true)
+        } else {
+            micPerm.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) scope.launch {
@@ -406,7 +482,7 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                                     Text(line, color = pal.accent, fontSize = 14.sp, textAlign = TextAlign.Center, maxLines = 2, modifier = Modifier.padding(top = 6.dp))
                                 }
                             }
-                            VizView(settings.visualizer, ui.playing, pal.accent, Modifier.fillMaxWidth().height(40.dp))
+                            VizView(settings.visualizer, ui.playing, pal.accent, Modifier.fillMaxWidth().height(40.dp), settings.reactive == 1)
                         }
                     }
                 }
@@ -517,11 +593,26 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                     )
                 }
                 item {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        item { Chip("All", view == "all", pal) { view = "all" } }
+                        item { Chip("Favorites", view == "fav", pal) { view = "fav" } }
+                        items(playlists, key = { it.id }) { pl ->
+                            Chip(pl.name, view == "pl:" + pl.id, pal) { view = "pl:" + pl.id }
+                        }
+                        item { Chip("+ Playlist", false, pal) { nameText = ""; nameDialog = "new" } }
+                    }
+                }
+                item {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Chip("All", !favOnly, pal) { favOnly = false }
-                        Chip("Favorites", favOnly, pal) { favOnly = true }
                         Chip("Sort: ${SORT_NAMES[settings.sort.coerceIn(0, 3)]}", false, pal) {
                             settings.update("sort", (settings.sort + 1) % 4)
+                        }
+                        if (currentPlaylist != null) {
+                            Chip("Rename", false, pal) { nameText = currentPlaylist.name; nameDialog = "rename" }
+                            Chip("Delete", false, pal) {
+                                persistPl(playlists.filter { it.id != currentPlaylist.id })
+                                view = "all"
+                            }
                         }
                     }
                 }
@@ -560,11 +651,79 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                         Box {
                             IconButton(onClick = { menuFor = song.uri }) { Icon(Icons.Default.MoreVert, null, tint = pal.muted) }
                             DropdownMenu(expanded = menuFor == song.uri, onDismissRequest = { menuFor = null }) {
+                                DropdownMenuItem(text = { Text("Add to playlist") }, onClick = { menuFor = null; addTo = song.uri })
+                                if (currentPlaylist != null) {
+                                    DropdownMenuItem(text = { Text("Remove from this playlist") }, onClick = {
+                                        menuFor = null
+                                        persistPl(playlists.map { if (it.id == currentPlaylist.id) it.copy(uris = it.uris - song.uri) else it })
+                                    })
+                                }
                                 DropdownMenuItem(text = { Text("Remove from library") }, onClick = { menuFor = null; remove(song) })
                             }
                         }
                     }
                 }
+            }
+
+            val nd = nameDialog
+            if (nd != null) {
+                AlertDialog(
+                    onDismissRequest = { nameDialog = null },
+                    containerColor = pal.bg, titleContentColor = pal.text, textContentColor = pal.text,
+                    title = { Text(if (nd == "rename") "Rename playlist" else "New playlist") },
+                    text = {
+                        OutlinedTextField(
+                            value = nameText, onValueChange = { nameText = it }, singleLine = true,
+                            placeholder = { Text("Playlist name", color = pal.muted) },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = pal.accent, unfocusedBorderColor = pal.muted.copy(alpha = .3f),
+                                focusedTextColor = pal.text, unfocusedTextColor = pal.text, cursorColor = pal.accent
+                            )
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            val name = nameText.trim()
+                            if (name.isNotEmpty()) {
+                                if (nd == "rename") {
+                                    val cp = currentPlaylist
+                                    if (cp != null) persistPl(playlists.map { if (it.id == cp.id) it.copy(name = name) else it })
+                                } else {
+                                    val first = if (nd.startsWith("newfor:")) listOf(nd.removePrefix("newfor:")) else emptyList()
+                                    val pl = Playlist(java.util.UUID.randomUUID().toString(), name, first)
+                                    persistPl(playlists + pl)
+                                    view = "pl:" + pl.id
+                                }
+                            }
+                            nameDialog = null
+                        }) { Text("Save", color = pal.accent) }
+                    },
+                    dismissButton = { TextButton(onClick = { nameDialog = null }) { Text("Cancel", color = pal.muted) } }
+                )
+            }
+
+            val at = addTo
+            if (at != null) {
+                AlertDialog(
+                    onDismissRequest = { addTo = null },
+                    containerColor = pal.bg, titleContentColor = pal.text, textContentColor = pal.text,
+                    title = { Text("Add to playlist") },
+                    text = {
+                        Column(Modifier.verticalScroll(rememberScrollState())) {
+                            playlists.forEach { pl ->
+                                TextButton(onClick = {
+                                    persistPl(playlists.map { if (it.id == pl.id && at !in it.uris) it.copy(uris = it.uris + at) else it })
+                                    addTo = null
+                                }) { Text(pl.name, color = pal.text) }
+                            }
+                            TextButton(onClick = { addTo = null; nameText = ""; nameDialog = "newfor:" + at }) {
+                                Text("+ New playlist", color = pal.accent)
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = { TextButton(onClick = { addTo = null }) { Text("Close", color = pal.muted) } }
+                )
             }
 
             if (sheet != Sheet.None) {
@@ -575,7 +734,17 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                     contentColor = pal.text
                 ) {
                     when (sheet) {
-                        Sheet.Settings -> SettingsSheet(settings, pal)
+                        Sheet.Settings -> SettingsSheet(
+                            settings, pal, folders, scanStatus,
+                            onAddFolder = { folderPicker.launch(null) },
+                            onRescan = { scanFolders(folders.map { Uri.parse(it) }) },
+                            onRemoveFolder = { f ->
+                                val l = folders - f
+                                folders = l
+                                Library.saveFolders(ctx, l)
+                            },
+                            onReactive = { setReactive(it) }
+                        )
                         Sheet.Sound -> SoundSheet(settings, pal, ui, player)
                         Sheet.Sleep -> SleepSheet(pal)
                         Sheet.Lyrics -> LyricsSheet(
@@ -648,7 +817,7 @@ private fun SleepButton(pal: Palette, onClick: () -> Unit) {
 }
 
 @Composable
-private fun VizView(style: Int, playing: Boolean, color: Color, modifier: Modifier) {
+private fun VizView(style: Int, playing: Boolean, color: Color, modifier: Modifier, reactive: Boolean) {
     val t = rememberInfiniteTransition(label = "viz")
     val phase by t.animateFloat(
         0f, (2 * Math.PI).toFloat(),
@@ -656,15 +825,21 @@ private fun VizView(style: Int, playing: Boolean, color: Color, modifier: Modifi
     )
     val amp by animateFloatAsState(if (playing) 1f else 0.1f, tween(500), label = "amp")
     Canvas(modifier) {
+        val levels = if (reactive && playing) PlayerHolder.vizLevels else null
         val w = size.width
         val h = size.height
+        // strength 0..1 for bar i of n: real audio when reactive, otherwise a smooth animation
+        fun a(i: Int, n: Int, speed: Float): Float =
+            if (levels != null) levels[(i * levels.size / n).coerceIn(0, levels.size - 1)]
+            else (0.1f + 0.9f * (0.5f + 0.5f * sin(phase * speed + i * 0.8f))) * amp
         when (style) {
             1 -> {
                 val path = Path()
                 val steps = 60
                 for (i in 0..steps) {
                     val x = w * i / steps
-                    val y = h / 2 + sin(phase * 2f + i * 0.28f) * h * 0.32f * amp * (0.6f + 0.4f * sin(phase + i * 0.11f))
+                    val v = a(i, steps + 1, 1f)
+                    val y = h / 2 + sin(phase * 2f + i * 0.28f) * h * 0.45f * v
                     if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
                 }
                 drawPath(path, color, style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round))
@@ -673,20 +848,21 @@ private fun VizView(style: Int, playing: Boolean, color: Color, modifier: Modifi
                 val n = 16
                 val gap = w / n
                 for (i in 0 until n) {
-                    val v = 0.5f + 0.5f * sin(phase * (1f + (i % 4) * 0.5f) + i)
+                    val v = a(i, n, 1f + (i % 4) * 0.5f)
                     drawCircle(
-                        color.copy(alpha = 0.35f + 0.65f * v),
-                        radius = (2f + 6f * v * amp).dp.toPx(),
+                        color.copy(alpha = (0.35f + 0.65f * v).coerceIn(0f, 1f)),
+                        radius = (2f + 7f * v).dp.toPx(),
                         center = Offset(gap * i + gap / 2f, h / 2f)
                     )
                 }
             }
             3 -> {
+                val bass = if (levels != null) levels.take(6).average().toFloat() else amp * 0.5f
                 for (k in 0 until 3) {
                     val f = ((phase / (2f * Math.PI.toFloat())) + k / 3f) % 1f
                     drawCircle(
-                        color.copy(alpha = ((1f - f) * 0.7f * (0.3f + 0.7f * amp)).coerceIn(0f, 1f)),
-                        radius = h * (0.1f + 0.5f * f),
+                        color.copy(alpha = ((1f - f) * 0.7f * (0.3f + 0.7f * maxOf(bass, amp * 0.4f))).coerceIn(0f, 1f)),
+                        radius = h * (0.1f + 0.5f * f) * (0.8f + 0.6f * bass),
                         center = Offset(w / 2f, h / 2f),
                         style = Stroke(width = 2.dp.toPx())
                     )
@@ -697,8 +873,8 @@ private fun VizView(style: Int, playing: Boolean, color: Color, modifier: Modifi
                 val bw = w / (n * 1.6f)
                 val gap = (w - bw * n) / (n - 1)
                 for (i in 0 until n) {
-                    val v = 0.5f + 0.5f * sin(phase * (1f + (i % 5) * 0.7f) + i * 0.8f)
-                    val bh = h * (0.1f + 0.9f * v * amp).coerceAtMost(1f)
+                    val v = a(i, n, 1f + (i % 5) * 0.7f)
+                    val bh = h * (0.08f + 0.92f * v).coerceIn(0f, 1f)
                     drawRoundRect(
                         color.copy(alpha = .85f),
                         topLeft = Offset(i * (bw + gap), (h - bh) / 2f),
@@ -725,9 +901,20 @@ private fun SheetBody(content: @Composable () -> Unit) {
     ) { content() }
 }
 
+private fun folderLabel(f: String): String = Uri.parse(f).lastPathSegment ?: f
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SettingsSheet(s: AppSettings, pal: Palette) {
+private fun SettingsSheet(
+    s: AppSettings,
+    pal: Palette,
+    folders: List<String>,
+    scanStatus: String,
+    onAddFolder: () -> Unit,
+    onRescan: () -> Unit,
+    onRemoveFolder: (String) -> Unit,
+    onReactive: (Boolean) -> Unit,
+) {
     SheetBody {
         Text("Appearance", color = pal.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Label("THEME", pal)
@@ -755,12 +942,36 @@ private fun SettingsSheet(s: AppSettings, pal: Palette) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             VIZ_NAMES.forEachIndexed { i, n -> Chip(n, s.visualizer == i, pal) { s.update("visualizer", i) } }
         }
-        Text("The visualizer is animated for looks and doesn't react to the audio.", color = pal.muted, fontSize = 12.sp)
+        Label("AUDIO-REACTIVE", pal)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Chip("On", s.reactive == 1, pal) { onReactive(true) }
+            Chip("Off", s.reactive == 0, pal) { onReactive(false) }
+        }
+        Text(
+            "Makes the visualizer move with the music. Android asks for the microphone permission for this, but Sonara only reads its own playback and never records or stores audio.",
+            color = pal.muted, fontSize = 12.sp
+        )
         Label("LIBRARY SORT", pal)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SORT_NAMES.forEachIndexed { i, n -> Chip(n, s.sort == i, pal) { s.update("sort", i) } }
         }
-        Text("Sonara 2.0", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+        Label("MUSIC FOLDERS", pal)
+        if (folders.isEmpty()) Text("No folders added yet.", color = pal.muted, fontSize = 13.sp)
+        folders.forEach { f ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(folderLabel(f), color = pal.text, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                TextButton(onClick = { onRemoveFolder(f) }) { Text("Remove", color = pal.muted) }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Chip("+ Add folder", false, pal, onAddFolder)
+            Chip("Rescan", false, pal, onRescan)
+        }
+        if (scanStatus.isNotEmpty()) Text(scanStatus, color = pal.accent, fontSize = 12.sp)
+        Text("Songs found are added to your library. Removing a folder here doesn't delete its songs from the library.", color = pal.muted, fontSize = 12.sp)
+        Label("HOME-SCREEN WIDGET", pal)
+        Text("Long-press an empty spot on your home screen, open Widgets and add Sonara.", color = pal.muted, fontSize = 13.sp)
+        Text("Sonara 2.1", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
     }
 }
 

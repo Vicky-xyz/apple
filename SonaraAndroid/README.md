@@ -1,4 +1,4 @@
-# Sonara for Android (v2)
+# Sonara for Android (v2.1)
 
 Local music player built with Kotlin, Jetpack Compose and Media3.
 
@@ -9,6 +9,10 @@ Local music player built with Kotlin, Jetpack Compose and Media3.
 - Sleep timer (15–90 min or end of song) with gentle fade-out
 - Equalizer presets, bass boost, fade between songs
 - Synced (.lrc) or plain lyrics, loaded per song
+- Audio-reactive visualizer (optional, uses the audio-analysis permission; never records)
+- Folder scanning: pick a folder and Sonara adds every song inside, subfolders included
+- Playlists: create, rename, delete, add/remove songs
+- Home-screen widget with cover art and previous / play / next
 - Themes: Dark, Light, AMOLED, System; 7 accent colors; 6 wallpapers; 4 visualizer styles
 
 ## Build with GitHub
@@ -22,5 +26,5 @@ Push this folder to a repo. The Actions workflow builds `app-debug.apk`
 3. Keep the .jks file safe; never commit it.
 
 ## Notes
-- The visualizer is animated for looks and is not audio-reactive.
+- With audio-reactive off, the visualizer is a looping animation.
 - Equalizer and bass boost depend on the phone's audio hardware.
