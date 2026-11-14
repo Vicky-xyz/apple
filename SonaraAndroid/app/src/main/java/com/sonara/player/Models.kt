@@ -1,7 +1,10 @@
 package com.sonara.player
 
 import android.content.Context
+import android.content.ContentUris
 import android.graphics.Bitmap
+import android.os.Build
+import android.provider.MediaStore
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -21,6 +24,7 @@ data class Song(
     val album: String,
     val durationMs: Long,
     val fav: Boolean = false,
+    val path: String = "",
 )
 
 data class LyricLine(val timeMs: Long, val text: String)
@@ -82,6 +86,7 @@ object Library {
                 o.optString("album", ""),
                 o.optLong("dur", 0L),
                 o.optBoolean("fav", false),
+                o.optString("path", ""),
             )
         }
     } catch (e: Exception) {
@@ -94,7 +99,7 @@ object Library {
             arr.put(
                 JSONObject()
                     .put("uri", it.uri).put("title", it.title).put("artist", it.artist)
-                    .put("album", it.album).put("dur", it.durationMs).put("fav", it.fav)
+                    .put("album", it.album).put("dur", it.durationMs).put("fav", it.fav).put("path", it.path)
             )
         }
         prefs(ctx).edit().putString("songs", arr.toString()).apply()
@@ -173,6 +178,70 @@ object Library {
 
     fun deleteLyrics(ctx: Context, uri: String) {
         lyricFile(ctx, uri).delete()
+    }
+
+    // ----- automatic device scan (reads the phone's media database; files are played by their path/URI) -----
+    @Suppress("DEPRECATION")
+    fun scanDevice(ctx: Context, minMs: Long, hidden: Set<String>): List<Song> {
+        val out = mutableListOf<Song>()
+        val volume = if (Build.VERSION.SDK_INT >= 29) {
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        }
+        val proj = arrayOf(
+            MediaStore.Audio.Media._ID,
+            MediaStore.Audio.Media.TITLE,
+            MediaStore.Audio.Media.ARTIST,
+            MediaStore.Audio.Media.ALBUM,
+            MediaStore.Audio.Media.DURATION,
+            MediaStore.Audio.Media.DATA,
+            MediaStore.Audio.Media.DISPLAY_NAME,
+        )
+        val sel = MediaStore.Audio.Media.IS_MUSIC + " != 0 AND " + MediaStore.Audio.Media.DURATION + " >= ?"
+        try {
+            ctx.contentResolver.query(
+                volume, proj, sel, arrayOf(minMs.toString()),
+                MediaStore.Audio.Media.DATE_ADDED + " DESC"
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getLong(0)
+                    val uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString()
+                    if (uri in hidden) continue
+                    val name = c.getString(6) ?: ""
+                    val title = c.getString(1)?.takeIf { it.isNotBlank() }
+                        ?: name.substringBeforeLast('.').ifBlank { "Unknown track" }
+                    val artistRaw = c.getString(2)
+                    val artist = if (artistRaw.isNullOrBlank() || artistRaw == "<unknown>") "Unknown artist" else artistRaw
+                    out.add(Song(uri, title, artist, c.getString(3) ?: "", c.getLong(4), false, c.getString(5) ?: ""))
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    /** Replaces device songs with the fresh scan, keeping favorites and hand-picked files. */
+    fun merge(existing: List<Song>, scanned: List<Song>): List<Song> {
+        if (scanned.isEmpty()) return existing
+        val favs = existing.filter { it.fav }.map { it.uri }.toSet()
+        val keys = scanned.map { it.title.lowercase() to it.durationMs }.toSet()
+        val fresh = scanned.map { if (it.uri in favs) it.copy(fav = true) else it }
+        val others = existing.filter {
+            !it.uri.startsWith("content://media/") && (it.title.lowercase() to it.durationMs) !in keys
+        }
+        return fresh + others
+    }
+
+    fun loadHidden(ctx: Context): Set<String> = try {
+        val arr = JSONArray(prefs(ctx).getString("hidden", "[]"))
+        List(arr.length()) { arr.getString(it) }.toSet()
+    } catch (e: Exception) {
+        emptySet()
+    }
+
+    fun saveHidden(ctx: Context, hidden: Set<String>) {
+        prefs(ctx).edit().putString("hidden", JSONArray(hidden.toList()).toString()).apply()
     }
 
     // ----- playlists -----

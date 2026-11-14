@@ -82,6 +82,7 @@ class AppSettings(ctx: Context) {
     var fadeSec by mutableIntStateOf(sp.getInt("fade", 0)); private set
     var sort by mutableIntStateOf(sp.getInt("sort", 0)); private set
     var reactive by mutableIntStateOf(sp.getInt("reactive", 0)); private set
+    var minLenSec by mutableIntStateOf(sp.getInt("minlen", 30)); private set
 
     var shuffle: Boolean = sp.getBoolean("shuffle", false)
     var repeat: Int = sp.getInt("repeat", 0)
@@ -98,6 +99,7 @@ class AppSettings(ctx: Context) {
             "fade" -> fadeSec = v
             "sort" -> sort = v
             "reactive" -> reactive = v
+            "minlen" -> minLenSec = v
         }
         sp.edit().putInt(key, v).apply()
     }

@@ -202,7 +202,7 @@ private enum class Sheet { None, Settings, Sound, Sleep, Lyrics }
 
 private val ON_ACCENT = Color(0xFF171426)
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
     val ctx = LocalContext.current
@@ -248,7 +248,10 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
             else -> songs
         }
         base
-            .filter { query.isBlank() || it.title.contains(query, true) || it.artist.contains(query, true) }
+            .filter {
+                query.isBlank() || it.title.contains(query, true) || it.artist.contains(query, true) ||
+                    it.path.contains(query, true)
+            }
             .let { l ->
                 when (settings.sort) {
                     1 -> l.sortedBy { it.title.lowercase() }
@@ -327,6 +330,7 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
             if (player.getMediaItemAt(i).mediaId == s.uri) player.removeMediaItem(i)
         }
         Library.deleteLyrics(ctx, s.uri)
+        if (s.uri.startsWith("content://media/")) Library.saveHidden(ctx, Library.loadHidden(ctx) + s.uri)
         persistPl(playlists.map { it.copy(uris = it.uris - s.uri) })
         persist(songs.filter { it.uri != s.uri })
     }
@@ -361,6 +365,43 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
         } else {
             micPerm.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+
+    val audioPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
+
+    fun hasAudioPerm(): Boolean =
+        ContextCompat.checkSelfPermission(ctx, audioPermission) == PackageManager.PERMISSION_GRANTED
+
+    fun scanDevice() {
+        scope.launch {
+            scanStatus = "Scanning your device…"
+            val found = withContext(Dispatchers.IO) {
+                Library.scanDevice(ctx, settings.minLenSec * 1000L, Library.loadHidden(ctx))
+            }
+            persist(Library.merge(songs, found))
+            scanStatus = "Found ${found.size} songs on this device"
+        }
+    }
+
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+        if (hasAudioPerm()) {
+            scanDevice()
+        } else {
+            scanStatus = "Allow access to your music so Sonara can find songs automatically."
+        }
+    }
+
+    fun requestScan() {
+        if (hasAudioPerm()) scanDevice() else permLauncher.launch(arrayOf(audioPermission))
+    }
+
+    LaunchedEffect(Unit) {
+        val need = mutableListOf<String>()
+        if (!hasAudioPerm()) need.add(audioPermission)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) need.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (need.isEmpty()) scanDevice() else permLauncher.launch(need.toTypedArray())
     }
 
     val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -603,10 +644,11 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                     }
                 }
                 item {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Chip("Sort: ${SORT_NAMES[settings.sort.coerceIn(0, 3)]}", false, pal) {
                             settings.update("sort", (settings.sort + 1) % 4)
                         }
+                        Chip("Scan device", false, pal) { requestScan() }
                         if (currentPlaylist != null) {
                             Chip("Rename", false, pal) { nameText = currentPlaylist.name; nameDialog = "rename" }
                             Chip("Delete", false, pal) {
@@ -619,11 +661,14 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
 
                 if (visible.isEmpty()) {
                     item {
-                        Text(
-                            if (songs.isEmpty()) "Your songs will appear here. Tap Add music to choose audio files from your device."
-                            else "No matching songs.",
-                            color = pal.muted, modifier = Modifier.fillMaxWidth().padding(24.dp)
-                        )
+                        Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                if (songs.isEmpty()) "No songs yet. Sonara finds the music on your phone automatically once you allow access."
+                                else "No matching songs.",
+                                color = pal.muted
+                            )
+                            if (songs.isEmpty()) Chip("Scan device", false, pal) { requestScan() }
+                        }
                     }
                 }
 
@@ -642,8 +687,10 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(song.title, color = pal.text, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            val len = if (song.durationMs > 0) " · " + clock(song.durationMs) else ""
-                            Text(song.artist + len, color = pal.muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val folder = song.path.substringBeforeLast('/', "").substringAfterLast('/')
+                            val extra = (if (folder.isNotEmpty()) " · " + folder else "") +
+                                (if (song.durationMs > 0) " · " + clock(song.durationMs) else "")
+                            Text(song.artist + extra, color = pal.muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         IconButton(onClick = { persist(songs.map { if (it.uri == song.uri) it.copy(fav = !it.fav) else it }) }) {
                             Icon(if (song.fav) Icons.Default.Favorite else Icons.Default.FavoriteBorder, null, tint = if (song.fav) pal.accent else pal.muted)
@@ -743,7 +790,9 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                                 folders = l
                                 Library.saveFolders(ctx, l)
                             },
-                            onReactive = { setReactive(it) }
+                            onReactive = { setReactive(it) },
+                            onScanDevice = { requestScan() },
+                            onRestoreHidden = { Library.saveHidden(ctx, emptySet()); requestScan() }
                         )
                         Sheet.Sound -> SoundSheet(settings, pal, ui, player)
                         Sheet.Sleep -> SleepSheet(pal)
@@ -914,6 +963,8 @@ private fun SettingsSheet(
     onRescan: () -> Unit,
     onRemoveFolder: (String) -> Unit,
     onReactive: (Boolean) -> Unit,
+    onScanDevice: () -> Unit,
+    onRestoreHidden: () -> Unit,
 ) {
     SheetBody {
         Text("Appearance", color = pal.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
@@ -955,6 +1006,18 @@ private fun SettingsSheet(
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SORT_NAMES.forEachIndexed { i, n -> Chip(n, s.sort == i, pal) { s.update("sort", i) } }
         }
+        Label("DEVICE MUSIC", pal)
+        Text("Sonara finds the music on your phone automatically every time it opens and plays each file straight from its location.", color = pal.muted, fontSize = 13.sp)
+        Label("IGNORE SONGS SHORTER THAN", pal)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(0, 30, 60).forEach { sec ->
+                Chip(if (sec == 0) "Nothing" else "${sec}s", s.minLenSec == sec, pal) { s.update("minlen", sec) }
+            }
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Chip("Scan device now", false, pal, onScanDevice)
+            Chip("Restore removed songs", false, pal, onRestoreHidden)
+        }
         Label("MUSIC FOLDERS", pal)
         if (folders.isEmpty()) Text("No folders added yet.", color = pal.muted, fontSize = 13.sp)
         folders.forEach { f ->
@@ -971,7 +1034,7 @@ private fun SettingsSheet(
         Text("Songs found are added to your library. Removing a folder here doesn't delete its songs from the library.", color = pal.muted, fontSize = 12.sp)
         Label("HOME-SCREEN WIDGET", pal)
         Text("Long-press an empty spot on your home screen, open Widgets and add Sonara.", color = pal.muted, fontSize = 13.sp)
-        Text("Sonara 2.1", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+        Text("Sonara 2.2", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
     }
 }
 
