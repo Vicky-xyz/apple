@@ -1,0 +1,149 @@
+package com.sonara.player
+
+import android.content.Context
+import android.media.audiofx.BassBoost
+import android.media.audiofx.Equalizer
+import android.os.SystemClock
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.abs
+
+/** One ExoPlayer shared by the UI and the background service, plus fade, sleep timer and audio effects. */
+object PlayerHolder {
+    private var player: ExoPlayer? = null
+    private var eq: Equalizer? = null
+    private var boost: BassBoost? = null
+    private var eqPreset = 0
+    private var boostStrength = 0
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    var fadeMs by mutableLongStateOf(0L)
+    var sleepEndAt by mutableLongStateOf(0L)
+    var sleepAtTrackEnd by mutableStateOf(false)
+
+    fun get(ctx: Context): ExoPlayer {
+        player?.let { return it }
+        val p = ExoPlayer.Builder(ctx.applicationContext)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                true
+            )
+            .setHandleAudioBecomingNoisy(true)
+            .setWakeMode(C.WAKE_MODE_LOCAL)
+            .build()
+        p.addListener(object : Player.Listener {
+            override fun onAudioSessionIdChanged(audioSessionId: Int) {
+                rebuildEffects()
+            }
+
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                val auto = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+                    reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
+                if (sleepAtTrackEnd && auto) {
+                    p.pause()
+                    sleepAtTrackEnd = false
+                }
+            }
+        })
+        player = p
+        rebuildEffects()
+        scope.launch { volumeLoop(p) }
+        return p
+    }
+
+    fun startSleep(minutes: Int) {
+        sleepAtTrackEnd = false
+        sleepEndAt = SystemClock.elapsedRealtime() + minutes * 60_000L
+    }
+
+    fun sleepAtEndOfTrack() {
+        sleepEndAt = 0L
+        sleepAtTrackEnd = true
+    }
+
+    fun cancelSleep() {
+        sleepEndAt = 0L
+        sleepAtTrackEnd = false
+    }
+
+    fun setEffects(preset: Int, bass: Int) {
+        eqPreset = preset
+        boostStrength = bass
+        rebuildEffects()
+    }
+
+    private suspend fun volumeLoop(p: ExoPlayer) {
+        while (true) {
+            delay(120)
+            var v = 1f
+            val fade = fadeMs
+            if (fade > 0 && p.isPlaying) {
+                val pos = p.currentPosition
+                val dur = p.duration
+                if (pos < fade) v = minOf(v, (pos.toFloat() / fade).coerceIn(0f, 1f))
+                if (dur > 0 && dur - pos < fade) v = minOf(v, ((dur - pos).toFloat() / fade).coerceIn(0f, 1f))
+            }
+            if (sleepEndAt > 0) {
+                val left = sleepEndAt - SystemClock.elapsedRealtime()
+                if (left <= 0) {
+                    p.pause()
+                    sleepEndAt = 0L
+                    v = 1f
+                } else if (left < 8000) {
+                    v = minOf(v, left / 8000f)
+                }
+            }
+            if (abs(p.volume - v) > 0.01f) p.volume = v
+        }
+    }
+
+    private fun rebuildEffects() {
+        val p = player ?: return
+        val id = p.audioSessionId
+        if (id == C.AUDIO_SESSION_ID_UNSET) return
+        try { eq?.release() } catch (_: Throwable) {}
+        try { boost?.release() } catch (_: Throwable) {}
+        eq = null
+        boost = null
+        try {
+            val e = Equalizer(0, id)
+            val n = e.numberOfBands.toInt()
+            val range = e.bandLevelRange
+            val curve = EQ_PRESETS[eqPreset.coerceIn(0, EQ_PRESETS.lastIndex)].gains
+            for (b in 0 until n) {
+                val t = if (n <= 1) 0f else b.toFloat() / (n - 1) * (curve.size - 1)
+                val lo = t.toInt().coerceAtMost(curve.size - 2)
+                val db = curve[lo] + (curve[lo + 1] - curve[lo]) * (t - lo)
+                val mb = (db * 100).toInt().coerceIn(range[0].toInt(), range[1].toInt())
+                e.setBandLevel(b.toShort(), mb.toShort())
+            }
+            e.setEnabled(true)
+            eq = e
+        } catch (_: Throwable) {
+        }
+        try {
+            val bb = BassBoost(0, id)
+            if (bb.strengthSupported) {
+                bb.setStrength(boostStrength.coerceIn(0, 1000).toShort())
+                bb.setEnabled(boostStrength > 0)
+            }
+            boost = bb
+        } catch (_: Throwable) {
+        }
+    }
+}
