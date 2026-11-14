@@ -2,15 +2,23 @@ package com.sonara.player
 
 import android.app.PendingIntent
 import android.content.Intent
+import androidx.annotation.OptIn
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 
 /** Keeps music playing in the background and provides the notification and lock-screen controls. */
+@OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
     private var session: MediaSession? = null
 
     override fun onCreate() {
         super.onCreate()
+        val provider = DefaultMediaNotificationProvider.Builder(this).build()
+        provider.setSmallIcon(R.drawable.ic_notif_disc)
+        setMediaNotificationProvider(provider)
+
         val player = PlayerHolder.get(this)
         val open = PendingIntent.getActivity(
             this, 0,
@@ -19,7 +27,6 @@ class PlaybackService : MediaSessionService() {
         )
         val s = MediaSession.Builder(this, player).setSessionActivity(open).build()
         session = s
-        // Without this the notification never appears, because nothing else connects to the session.
         addSession(s)
     }
 

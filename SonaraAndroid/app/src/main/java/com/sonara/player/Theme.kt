@@ -61,12 +61,13 @@ fun buildPalette(s: AppSettings, systemDark: Boolean): Palette {
     val amoled = s.theme == 2
     val acc = ACCENTS[s.accent.coerceIn(0, ACCENTS.lastIndex)]
     val wall = WALLS[s.wallpaper.coerceIn(0, WALLS.lastIndex)]
+    val a = (0.92f - 0.65f * s.glass / 100f).coerceIn(0.2f, 0.95f)
     return if (light) {
-        Palette(true, Color(0xFFF2F4FB), Color(0xDFFFFFFF), Color(0xFF17182B), Color(0xFF777B91), acc.light, wall.light)
+        Palette(true, Color(0xFFF2F4FB), Color(0xFFFFFFFF).copy(alpha = a), Color(0xFF17182B), Color(0xFF777B91), acc.light, wall.light)
     } else if (amoled) {
-        Palette(false, Color(0xFF000000), Color(0xFF121212), Color(0xFFF5F4FF), Color(0xFF9A9DB5), acc.dark, Color(0xFF000000))
+        Palette(false, Color(0xFF000000), Color(0xFF121212).copy(alpha = a), Color(0xFFF5F4FF), Color(0xFF9A9DB5), acc.dark, Color(0xFF000000))
     } else {
-        Palette(false, Color(0xFF090B16), Color(0xCC171A2B), Color(0xFFF5F4FF), Color(0xFF9A9DB5), acc.dark, wall.dark)
+        Palette(false, Color(0xFF090B16), Color(0xFF171A2B).copy(alpha = a), Color(0xFFF5F4FF), Color(0xFF9A9DB5), acc.dark, wall.dark)
     }
 }
 
@@ -83,6 +84,19 @@ class AppSettings(ctx: Context) {
     var sort by mutableIntStateOf(sp.getInt("sort", 0)); private set
     var reactive by mutableIntStateOf(sp.getInt("reactive", 0)); private set
     var minLenSec by mutableIntStateOf(sp.getInt("minlen", 30)); private set
+    var vizBars by mutableIntStateOf(sp.getInt("vizbars", 32)); private set
+    var vizColor by mutableIntStateOf(sp.getInt("vizcolor", 0)); private set
+    var vizSens by mutableIntStateOf(sp.getInt("vizsens", 1)); private set
+    var vizHeight by mutableIntStateOf(sp.getInt("vizheight", 1)); private set
+    var vizThick by mutableIntStateOf(sp.getInt("vizthick", 1)); private set
+    var vizShape by mutableIntStateOf(sp.getInt("vizshape", 0)); private set
+    var vizMirror by mutableIntStateOf(sp.getInt("vizmirror", 0)); private set
+    var spin by mutableIntStateOf(sp.getInt("spin", 1)); private set
+    var folderSep by mutableIntStateOf(sp.getInt("foldersep", 1)); private set
+    var glass by mutableIntStateOf(sp.getInt("glass", 25)); private set
+    var wallType by mutableIntStateOf(sp.getInt("walltype", 0)); private set
+    var wallBlur by mutableIntStateOf(sp.getInt("wallblur", 12)); private set
+    var wallDim by mutableIntStateOf(sp.getInt("walldim", 35)); private set
 
     var shuffle: Boolean = sp.getBoolean("shuffle", false)
     var repeat: Int = sp.getInt("repeat", 0)
@@ -100,6 +114,19 @@ class AppSettings(ctx: Context) {
             "sort" -> sort = v
             "reactive" -> reactive = v
             "minlen" -> minLenSec = v
+            "vizbars" -> vizBars = v
+            "vizcolor" -> vizColor = v
+            "vizsens" -> vizSens = v
+            "vizheight" -> vizHeight = v
+            "vizthick" -> vizThick = v
+            "vizshape" -> vizShape = v
+            "vizmirror" -> vizMirror = v
+            "spin" -> spin = v
+            "foldersep" -> folderSep = v
+            "glass" -> glass = v
+            "walltype" -> wallType = v
+            "wallblur" -> wallBlur = v
+            "walldim" -> wallDim = v
         }
         sp.edit().putInt(key, v).apply()
     }

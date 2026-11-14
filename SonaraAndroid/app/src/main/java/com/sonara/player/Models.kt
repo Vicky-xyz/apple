@@ -5,6 +5,8 @@ import android.content.ContentUris
 import android.graphics.Bitmap
 import android.os.Build
 import android.provider.MediaStore
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -242,6 +244,29 @@ object Library {
 
     fun saveHidden(ctx: Context, hidden: Set<String>) {
         prefs(ctx).edit().putString("hidden", JSONArray(hidden.toList()).toString()).apply()
+    }
+
+    // ----- custom wallpaper -----
+    fun saveWallpaper(ctx: Context, uri: Uri): Boolean {
+        try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 1800) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                ?: return false
+            File(ctx.filesDir, "wallpaper.jpg").outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+            return true
+        } catch (e: Throwable) {
+            return false
+        }
+    }
+
+    fun loadWallpaper(ctx: Context): ImageBitmap? {
+        val f = File(ctx.filesDir, "wallpaper.jpg")
+        if (!f.exists()) return null
+        return try { BitmapFactory.decodeFile(f.path)?.asImageBitmap() } catch (e: Throwable) { null }
     }
 
     // ----- playlists -----
