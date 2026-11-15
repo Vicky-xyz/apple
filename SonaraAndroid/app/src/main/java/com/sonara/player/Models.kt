@@ -3,6 +3,8 @@ package com.sonara.player
 import android.content.Context
 import android.content.ContentUris
 import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.os.Build
 import android.provider.MediaStore
 import androidx.compose.ui.graphics.ImageBitmap
@@ -293,8 +295,79 @@ object Library {
     }
 
     fun promoteDraftWallpaper(ctx: Context) {
-        val d = File(ctx.filesDir, "wallpaper_draft.jpg")
-        if (d.exists()) d.copyTo(File(ctx.filesDir, "wallpaper.jpg"), overwrite = true)
+        val pairs = listOf("wallpaper_draft.jpg" to "wallpaper.jpg", "wallpaper_src_draft.jpg" to "wallpaper_src.jpg")
+        for ((from, to) in pairs) {
+            val f = File(ctx.filesDir, from)
+            if (f.exists()) f.copyTo(File(ctx.filesDir, to), overwrite = true)
+        }
+    }
+
+    fun clearDraftWallpaper(ctx: Context) {
+        File(ctx.filesDir, "wallpaper_draft.jpg").delete()
+        File(ctx.filesDir, "wallpaper_src_draft.jpg").delete()
+    }
+
+    /** Decodes a picked photo (downsampled, rotated upright) so it can be cropped. */
+    fun decodeSampled(ctx: Context, uri: Uri, maxSide: Int): Bitmap? {
+        try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxSide) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                ?: return null
+            val orientation = try {
+                ctx.contentResolver.openInputStream(uri)?.use {
+                    ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                } ?: ExifInterface.ORIENTATION_NORMAL
+            } catch (e: Throwable) {
+                ExifInterface.ORIENTATION_NORMAL
+            }
+            val deg = when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+            return if (deg != 0f) {
+                Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(deg) }, true)
+            } else bmp
+        } catch (e: Throwable) {
+            return null
+        }
+    }
+
+    fun saveBitmap(ctx: Context, bmp: Bitmap, name: String) {
+        File(ctx.filesDir, name).outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+    }
+
+    fun loadBitmap(ctx: Context, name: String): Bitmap? {
+        val f = File(ctx.filesDir, name)
+        if (!f.exists()) return null
+        return try { BitmapFactory.decodeFile(f.path) } catch (e: Throwable) { null }
+    }
+
+    /** Saves the rectangle the user framed (in source-image pixels) as the wallpaper picture. */
+    fun cropAndSave(ctx: Context, src: Bitmap, x: Int, y: Int, w: Int, h: Int, name: String): Boolean {
+        try {
+            val cx = x.coerceIn(0, src.width - 1)
+            val cy = y.coerceIn(0, src.height - 1)
+            val cw = w.coerceIn(1, src.width - cx)
+            val ch = h.coerceIn(1, src.height - cy)
+            var out = Bitmap.createBitmap(src, cx, cy, cw, ch)
+            val longSide = maxOf(out.width, out.height)
+            if (longSide > 1800) {
+                val sc = 1800f / longSide
+                out = Bitmap.createScaledBitmap(
+                    out, (out.width * sc).toInt().coerceAtLeast(1), (out.height * sc).toInt().coerceAtLeast(1), true
+                )
+            }
+            saveBitmap(ctx, out, name)
+            return true
+        } catch (e: Throwable) {
+            return false
+        }
     }
 
     // ----- playlists -----

@@ -1,4 +1,4 @@
-# Sonara for Android (v2.5)
+# Sonara for Android (v2.6)
 
 Local music player built with Kotlin, Jetpack Compose and Media3.
 
@@ -18,7 +18,7 @@ Local music player built with Kotlin, Jetpack Compose and Media3.
 - Folder scanning: pick a folder and Sonara adds every song inside, subfolders included
 - Playlists: create, rename, delete, add/remove songs
 - Home-screen widget with cover art and previous / play / next
-- Separate Customize window with live, resizable preview; changes apply only when you tap Apply
+- Separate Customize window: pinned live preview, settings in sub-windows, manual photo cropping; changes apply only when you tap Apply
 - 6 soft themes (3 light, 3 dark) with smooth color transitions; glow and shadows that follow the song's artwork; 4 visualizer styles
 
 ## Build with GitHub

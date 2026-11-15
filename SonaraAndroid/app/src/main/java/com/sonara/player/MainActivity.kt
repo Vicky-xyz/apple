@@ -3,6 +3,7 @@ package com.sonara.player
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
@@ -33,6 +34,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -145,7 +149,9 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -417,20 +423,43 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
         }
     }
 
+    var cropSource by remember { mutableStateOf<Bitmap?>(null) }
+
     val wallPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
-            val ok = withContext(Dispatchers.IO) { Library.saveWallpaper(ctx, uri, "wallpaper_draft.jpg") }
+            val bmp = withContext(Dispatchers.IO) {
+                Library.decodeSampled(ctx, uri, 2400)?.also { Library.saveBitmap(ctx, it, "wallpaper_src_draft.jpg") }
+            }
+            if (bmp != null) cropSource = bmp
+        }
+    }
+
+    fun recrop() {
+        scope.launch {
+            val bmp = withContext(Dispatchers.IO) {
+                Library.loadBitmap(ctx, "wallpaper_src_draft.jpg") ?: Library.loadBitmap(ctx, "wallpaper_src.jpg")
+            }
+            if (bmp != null) cropSource = bmp else wallPicker.launch(arrayOf("image/*"))
+        }
+    }
+
+    fun finishCrop(x: Int, y: Int, w: Int, h: Int) {
+        val src = cropSource ?: return
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { Library.cropAndSave(ctx, src, x, y, w, h, "wallpaper_draft.jpg") }
             if (ok) {
                 draftPhoto = withContext(Dispatchers.IO) { Library.loadWallpaper(ctx, "wallpaper_draft.jpg") }
                 photoChanged = true
                 draft.update("walltype", 1)
             }
+            cropSource = null
         }
     }
 
     LaunchedEffect(customizing) {
         if (customizing) {
             photoChanged = false
+            withContext(Dispatchers.IO) { Library.clearDraftWallpaper(ctx) }
             draftPhoto = wallImage ?: withContext(Dispatchers.IO) { Library.loadWallpaper(ctx) }
         }
     }
@@ -861,8 +890,20 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                 CustomizeWindow(
                     d = draft, pal = pal, songColor = songColor, art = art, photo = draftPhoto,
                     onPickPhoto = { wallPicker.launch(arrayOf("image/*")) },
+                    onRecrop = { recrop() },
                     onApply = { applyCustomize() },
                     onCancel = { customizing = false }
+                )
+            }
+
+            cropSource?.let { bmp ->
+                BackHandler { cropSource = null }
+                val dm = ctx.resources.displayMetrics
+                CropScreen(
+                    bmp = bmp,
+                    screenAspect = dm.heightPixels.toFloat() / dm.widthPixels.toFloat(),
+                    onCancel = { cropSource = null },
+                    onDone = { x, y, w, h -> finishCrop(x, y, w, h) }
                 )
             }
 
@@ -1094,7 +1135,7 @@ private fun SettingSlider(title: String, value: Int, max: Int, pal: Palette, min
     )
 }
 
-/** Wallpaper image (photo or album art) with zoom, position, blur and dimming. */
+/** Wallpaper image (photo or album art) with blur and dimming. */
 @Composable
 private fun WallpaperLayer(s: AppSettings, pal: Palette, photo: ImageBitmap?, art: ImageBitmap?) {
     val wp = when (s.wallType) { 1 -> photo; 2 -> art; else -> null }
@@ -1102,15 +1143,7 @@ private fun WallpaperLayer(s: AppSettings, pal: Palette, photo: ImageBitmap?, ar
         Box(Modifier.fillMaxSize().clipToBounds()) {
             Image(
                 wp, null,
-                Modifier.fillMaxSize()
-                    .graphicsLayer {
-                        val z = if (s.wallType == 1) s.wallZoom / 100f else 1f
-                        scaleX = z
-                        scaleY = z
-                        translationX = (s.wallX - 50) / 50f * size.width * (z - 1f) / 2f
-                        translationY = (s.wallY - 50) / 50f * size.height * (z - 1f) / 2f
-                    }
-                    .then(if (s.wallBlur > 0) Modifier.blur(s.wallBlur.dp) else Modifier),
+                Modifier.fillMaxSize().then(if (s.wallBlur > 0) Modifier.blur(s.wallBlur.dp) else Modifier),
                 contentScale = ContentScale.Crop
             )
             Box(Modifier.fillMaxSize().background((if (pal.light) Color.White else Color.Black).copy(alpha = s.wallDim / 100f)))
@@ -1185,7 +1218,10 @@ private fun PreviewScreen(d: AppSettings, p: Palette, photo: ImageBitmap?, art: 
     }
 }
 
-/** Full-screen appearance window. Everything is edited on a draft and only saved when Apply is tapped. */
+/**
+ * Full-screen appearance window. The preview stays pinned at the top so every change is visible
+ * without scrolling; the controls live in sub-windows (tabs) underneath. Nothing is saved until Apply.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CustomizeWindow(
@@ -1195,110 +1231,208 @@ private fun CustomizeWindow(
     art: ImageBitmap?,
     photo: ImageBitmap?,
     onPickPhoto: () -> Unit,
+    onRecrop: () -> Unit,
     onApply: () -> Unit,
     onCancel: () -> Unit,
 ) {
     val dpal = buildPalette(d, songColor)
-    var previewSize by remember { mutableIntStateOf(1) }
-    val maxW = LocalConfiguration.current.screenWidthDp.dp - 40.dp
-    val pw = maxW * listOf(0.5f, 0.72f, 1f)[previewSize]
-    val ph = pw * 1.55f
-    val k = pw.value / 300f
+    var tab by remember { mutableIntStateOf(0) }
+    val panelScroll = rememberScrollState()
+    LaunchedEffect(tab) { panelScroll.scrollTo(0) }
+    val panelH = LocalConfiguration.current.screenHeightDp.dp * 0.36f
     val theme = THEMES[d.palette.coerceIn(0, THEMES.lastIndex)]
 
     Column(
         Modifier.fillMaxSize().background(pal.bg)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }
-            .statusBarsPadding()
+            .statusBarsPadding().navigationBarsPadding()
     ) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = onCancel) { Text("Cancel", color = pal.muted) }
             Text("Customize", color = pal.text, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
             Button(onClick = onApply, colors = ButtonDefaults.buttonColors(containerColor = pal.accent, contentColor = pal.onAccent)) {
                 Text("Apply")
             }
         }
-        Column(
-            Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)
-                .navigationBarsPadding().padding(bottom = 32.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+
+        // pinned live preview: as large as the space allows
+        BoxWithConstraints(
+            Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            contentAlignment = Alignment.Center
         ) {
-            Text("Changes show in the preview and are saved only when you tap Apply. Cancel or Back throws them away.", color = pal.muted, fontSize = 12.sp)
-            ChipGroup("PREVIEW SIZE", listOf("Small", "Medium", "Large"), previewSize, pal) { previewSize = it }
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            val k = minOf(maxWidth.value / 300f, maxHeight.value / 465f)
+            Box(
+                Modifier.size((300f * k).dp, (465f * k).dp).clip(RoundedCornerShape(24.dp))
+                    .border(1.dp, pal.muted.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
+            ) {
                 Box(
-                    Modifier.size(pw, ph).clip(RoundedCornerShape(28.dp))
-                        .border(1.dp, pal.muted.copy(alpha = 0.4f), RoundedCornerShape(28.dp))
-                ) {
-                    Box(
-                        Modifier.requiredSize(300.dp, 465.dp).graphicsLayer {
-                            scaleX = k
-                            scaleY = k
-                            transformOrigin = TransformOrigin(0f, 0f)
-                        }
-                    ) { PreviewScreen(d, dpal, photo, art) }
-                }
+                    Modifier.requiredSize(300.dp, 465.dp).graphicsLayer {
+                        scaleX = k
+                        scaleY = k
+                        transformOrigin = TransformOrigin(0f, 0f)
+                    }
+                ) { PreviewScreen(d, dpal, photo, art) }
             }
+        }
 
-            Label("THEME  ·  LIGHT", pal)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                THEMES.forEachIndexed { i, t -> if (t.light) ThemeChip(t, d.palette == i, pal) { d.update("palette", i) } }
+        // sub-window tabs
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf("Theme", "Wallpaper", "Adjust", "Effects", "Visualizer").forEachIndexed { i, n ->
+                Chip(n, tab == i, pal) { tab = i }
             }
-            Label("THEME  ·  DARK", pal)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                THEMES.forEachIndexed { i, t -> if (!t.light) ThemeChip(t, d.palette == i, pal) { d.update("palette", i) } }
-            }
+        }
 
-            Label("WALLPAPER", pal)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                WallTile("Gradient", d.wallType == 0, pal, { d.update("walltype", 0) }) {
-                    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(lerp(theme.bg, wallTint(theme, d.wallpaper), 0.65f), theme.bg))))
-                }
-                WallTile("My photo", d.wallType == 1, pal, { if (photo == null) onPickPhoto() else d.update("walltype", 1) }) {
-                    if (photo != null) Image(photo, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                    else Text("+", color = pal.muted, fontSize = 28.sp, modifier = Modifier.align(Alignment.Center))
-                }
-                WallTile("Album art", d.wallType == 2, pal, { d.update("walltype", 2) }) {
-                    if (art != null) Image(art, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                    else Text("plays a song first", color = pal.muted, fontSize = 10.sp, textAlign = TextAlign.Center, modifier = Modifier.align(Alignment.Center).padding(4.dp))
-                }
-            }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Chip("Choose photo…", false, pal, onPickPhoto) }
-
-            Label("GRADIENT STYLE", pal)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                WALLS.forEachIndexed { i, w ->
-                    WallTile(w.name, d.wallpaper == i, pal, { d.update("wallpaper", i); d.update("walltype", 0) }) {
-                        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(lerp(theme.bg, wallTint(theme, i), 0.65f), theme.bg))))
+        Column(
+            Modifier.fillMaxWidth().height(panelH).verticalScroll(panelScroll)
+                .padding(horizontal = 20.dp).padding(bottom = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            when (tab) {
+                0 -> {
+                    Label("LIGHT", pal)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        THEMES.forEachIndexed { i, t -> if (t.light) ThemeChip(t, d.palette == i, pal) { d.update("palette", i) } }
+                    }
+                    Label("DARK", pal)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        THEMES.forEachIndexed { i, t -> if (!t.light) ThemeChip(t, d.palette == i, pal) { d.update("palette", i) } }
                     }
                 }
+                1 -> {
+                    Label("SOURCE", pal)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        WallTile("Gradient", d.wallType == 0, pal, { d.update("walltype", 0) }) {
+                            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(lerp(theme.bg, wallTint(theme, d.wallpaper), 0.65f), theme.bg))))
+                        }
+                        WallTile("My photo", d.wallType == 1, pal, { if (photo == null) onPickPhoto() else d.update("walltype", 1) }) {
+                            if (photo != null) Image(photo, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            else Text("+", color = pal.muted, fontSize = 28.sp, modifier = Modifier.align(Alignment.Center))
+                        }
+                        WallTile("Album art", d.wallType == 2, pal, { d.update("walltype", 2) }) {
+                            if (art != null) Image(art, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            else Text("play a song first", color = pal.muted, fontSize = 10.sp, textAlign = TextAlign.Center, modifier = Modifier.align(Alignment.Center).padding(4.dp))
+                        }
+                    }
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Chip("Choose and crop photo…", false, pal, onPickPhoto)
+                        if (photo != null) Chip("Crop again", false, pal, onRecrop)
+                    }
+                    Label("GRADIENT STYLE", pal)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        WALLS.forEachIndexed { i, w ->
+                            WallTile(w.name, d.wallpaper == i, pal, { d.update("wallpaper", i); d.update("walltype", 0) }) {
+                                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(lerp(theme.bg, wallTint(theme, i), 0.65f), theme.bg))))
+                            }
+                        }
+                    }
+                }
+                2 -> {
+                    SettingSlider("WALLPAPER BLUR  ${d.wallBlur}", d.wallBlur, 30, pal) { d.update("wallblur", it) }
+                    Text("Blur needs Android 12 or newer.", color = pal.muted, fontSize = 12.sp)
+                    SettingSlider("WALLPAPER DIMMING  ${d.wallDim}%", d.wallDim, 80, pal) { d.update("walldim", it) }
+                    SettingSlider("GLASS TRANSPARENCY  ${d.glass}%", d.glass, 100, pal) { d.update("glass", it) }
+                }
+                3 -> {
+                    ChipGroup("SONG-COLORED SHADOW AND GLOW", listOf("Off", "On"), d.songGlow, pal) { d.update("songglow", it) }
+                    ChipGroup("ACCENT FOLLOWS THE SONG", listOf("Off", "On"), d.dynAccent, pal) { d.update("dynaccent", it) }
+                    ChipGroup("PAGE COLOR SHIFT (favorites, playlists, folders)", listOf("Off", "On"), d.pageTint, pal) { d.update("pagetint", it) }
+                    ChipGroup("SPINNING DISC ON THE PLAYING SONG", listOf("Off", "On"), d.spin, pal) { d.update("spin", it) }
+                }
+                else -> {
+                    ChipGroup("STYLE", VIZ_NAMES, d.visualizer, pal) { d.update("visualizer", it) }
+                    ChipGroup("BARS", listOf("16", "24", "32", "48"), listOf(16, 24, 32, 48).indexOf(d.vizBars).coerceAtLeast(0), pal) {
+                        d.update("vizbars", listOf(16, 24, 32, 48)[it])
+                    }
+                    ChipGroup("COLOR", listOf("Accent", "Palette mix", "Neutral", "Gradient"), d.vizColor, pal) { d.update("vizcolor", it) }
+                    ChipGroup("SENSITIVITY", listOf("Low", "Medium", "High"), d.vizSens, pal) { d.update("vizsens", it) }
+                    ChipGroup("HEIGHT", listOf("Compact", "Normal", "Tall", "Big"), d.vizHeight, pal) { d.update("vizheight", it) }
+                    ChipGroup("BAR WIDTH", listOf("Thin", "Normal", "Thick"), d.vizThick, pal) { d.update("vizthick", it) }
+                    ChipGroup("BAR SHAPE", listOf("Rounded", "Square"), d.vizShape, pal) { d.update("vizshape", it) }
+                    ChipGroup("MIRROR (bass in the middle)", listOf("Off", "On"), d.vizMirror, pal) { d.update("vizmirror", it) }
+                }
             }
+        }
+    }
+}
 
-            if (d.wallType == 1) {
-                SettingSlider("PHOTO ZOOM  ${d.wallZoom}%", d.wallZoom, 300, pal, min = 100) { d.update("wallzoom", it) }
-                SettingSlider("PHOTO POSITION  ·  LEFT / RIGHT", d.wallX, 100, pal) { d.update("wallx", it) }
-                SettingSlider("PHOTO POSITION  ·  UP / DOWN", d.wallY, 100, pal) { d.update("wally", it) }
+/** Manual crop: drag and pinch the photo inside a frame shaped like the phone screen. */
+@Composable
+private fun CropScreen(bmp: Bitmap, screenAspect: Float, onCancel: () -> Unit, onDone: (Int, Int, Int, Int) -> Unit) {
+    val density = LocalDensity.current
+    val image = remember(bmp) { bmp.asImageBitmap() }
+    var scale by remember(bmp) { mutableFloatStateOf(1f) }
+    var offX by remember(bmp) { mutableFloatStateOf(0f) }
+    var offY by remember(bmp) { mutableFloatStateOf(0f) }
+
+    Column(
+        Modifier.fillMaxSize().background(Color.Black)
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }
+            .statusBarsPadding().navigationBarsPadding()
+    ) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onCancel) { Text("Cancel", color = Color.White) }
+            Text("Crop wallpaper", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
+            Spacer(Modifier.width(64.dp))
+        }
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+            val maxWpx = with(density) { maxWidth.toPx() }
+            val maxHpx = with(density) { maxHeight.toPx() }
+            val fitsWidth = maxWpx * 0.9f * screenAspect <= maxHpx * 0.74f
+            val fw = if (fitsWidth) maxWpx * 0.9f else maxHpx * 0.74f / screenAspect
+            val fh = fw * screenAspect
+            val s0 = maxOf(fw / bmp.width, fh / bmp.height)
+            val dispW = bmp.width * s0 * scale
+            val dispH = bmp.height * s0 * scale
+
+            Box(
+                Modifier.fillMaxSize().pointerInput(fw, fh, s0) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        val ns = (scale * zoom).coerceIn(1f, 6f)
+                        val mx = ((bmp.width * s0 * ns - fw) / 2f).coerceAtLeast(0f)
+                        val my = ((bmp.height * s0 * ns - fh) / 2f).coerceAtLeast(0f)
+                        scale = ns
+                        offX = (offX + pan.x).coerceIn(-mx, mx)
+                        offY = (offY + pan.y).coerceIn(-my, my)
+                    }
+                },
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    Modifier.size(with(density) { fw.toDp() }, with(density) { fh.toDp() })
+                        .clipToBounds().border(2.dp, Color.White),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Image(
+                        image, null,
+                        Modifier.requiredSize(with(density) { dispW.toDp() }, with(density) { dispH.toDp() })
+                            .graphicsLayer {
+                                translationX = offX
+                                translationY = offY
+                            },
+                        contentScale = ContentScale.FillBounds
+                    )
+                }
             }
-            SettingSlider("WALLPAPER BLUR  ${d.wallBlur}", d.wallBlur, 30, pal) { d.update("wallblur", it) }
-            Text("Blur needs Android 12 or newer.", color = pal.muted, fontSize = 12.sp)
-            SettingSlider("WALLPAPER DIMMING  ${d.wallDim}%", d.wallDim, 80, pal) { d.update("walldim", it) }
-            SettingSlider("GLASS TRANSPARENCY  ${d.glass}%", d.glass, 100, pal) { d.update("glass", it) }
-
-            ChipGroup("SONG-COLORED SHADOW AND GLOW", listOf("Off", "On"), d.songGlow, pal) { d.update("songglow", it) }
-            ChipGroup("ACCENT FOLLOWS THE SONG", listOf("Off", "On"), d.dynAccent, pal) { d.update("dynaccent", it) }
-            ChipGroup("PAGE COLOR SHIFT (favorites, playlists, folders)", listOf("Off", "On"), d.pageTint, pal) { d.update("pagetint", it) }
-            ChipGroup("SPINNING DISC ON THE PLAYING SONG", listOf("Off", "On"), d.spin, pal) { d.update("spin", it) }
-
-            ChipGroup("VISUALIZER STYLE", VIZ_NAMES, d.visualizer, pal) { d.update("visualizer", it) }
-            ChipGroup("BARS", listOf("16", "24", "32", "48"), listOf(16, 24, 32, 48).indexOf(d.vizBars).coerceAtLeast(0), pal) {
-                d.update("vizbars", listOf(16, 24, 32, 48)[it])
+            Text(
+                "Drag to move  ·  pinch to zoom", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp,
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 6.dp)
+            )
+            Row(
+                Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = { scale = 1f; offX = 0f; offY = 0f }) { Text("Reset", color = Color.White) }
+                Button(onClick = {
+                    val f = 1f / (s0 * scale)
+                    val x0 = (dispW / 2f - fw / 2f - offX) * f
+                    val y0 = (dispH / 2f - fh / 2f - offY) * f
+                    onDone(x0.toInt(), y0.toInt(), (fw * f).toInt(), (fh * f).toInt())
+                }) { Text("Done") }
             }
-            ChipGroup("COLOR", listOf("Accent", "Palette mix", "Neutral", "Gradient"), d.vizColor, pal) { d.update("vizcolor", it) }
-            ChipGroup("SENSITIVITY", listOf("Low", "Medium", "High"), d.vizSens, pal) { d.update("vizsens", it) }
-            ChipGroup("HEIGHT", listOf("Compact", "Normal", "Tall", "Big"), d.vizHeight, pal) { d.update("vizheight", it) }
-            ChipGroup("BAR WIDTH", listOf("Thin", "Normal", "Thick"), d.vizThick, pal) { d.update("vizthick", it) }
-            ChipGroup("BAR SHAPE", listOf("Rounded", "Square"), d.vizShape, pal) { d.update("vizshape", it) }
-            ChipGroup("MIRROR (bass in the middle)", listOf("Off", "On"), d.vizMirror, pal) { d.update("vizmirror", it) }
         }
     }
 }
@@ -1478,7 +1612,7 @@ private fun SettingsSheet(
         Text("Songs found are added to your library. Removing a folder here doesn't delete its songs from the library.", color = pal.muted, fontSize = 12.sp)
         Label("HOME-SCREEN WIDGET", pal)
         Text("Long-press an empty spot on your home screen, open Widgets and add Sonara.", color = pal.muted, fontSize = 13.sp)
-        Text("Sonara 2.5", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+        Text("Sonara 2.6", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
     }
 }
 
