@@ -43,6 +43,83 @@ fun Song.toMediaItem(): MediaItem = MediaItem.Builder()
     )
     .build()
 
+private val collator: java.text.Collator =
+    java.text.Collator.getInstance().apply { strength = java.text.Collator.PRIMARY }
+
+private fun sortKey(s: String, skipArticles: Boolean): String {
+    var t = s.trim().lowercase()
+    if (skipArticles) {
+        for (p in listOf("the ", "an ", "a ")) {
+            if (t.startsWith(p) && t.length > p.length) {
+                t = t.substring(p.length)
+                break
+            }
+        }
+    }
+    return t
+}
+
+/** Case- and accent-insensitive compare where numbers are ordered by value (2 before 10). */
+fun naturalCompare(a: String, b: String, skipArticles: Boolean = true): Int {
+    val x = sortKey(a, skipArticles)
+    val y = sortKey(b, skipArticles)
+    var i = 0
+    var j = 0
+    while (i < x.length && j < y.length) {
+        if (x[i].isDigit() && y[j].isDigit()) {
+            var ie = i
+            while (ie < x.length && x[ie].isDigit()) ie++
+            var je = j
+            while (je < y.length && y[je].isDigit()) je++
+            val nx = x.substring(i, ie).trimStart('0')
+            val ny = y.substring(j, je).trimStart('0')
+            if (nx.length != ny.length) return nx.length - ny.length
+            val c = nx.compareTo(ny)
+            if (c != 0) return c
+            i = ie
+            j = je
+        } else {
+            val c = collator.compare(x[i].toString(), y[j].toString())
+            if (c != 0) return c
+            i++
+            j++
+        }
+    }
+    return (x.length - i) - (y.length - j)
+}
+
+/**
+ * mode: 0 recently added, 1 title, 2 artist, 3 length, 4 album, 5 folder, 6 most played, 7 favorites first.
+ * In a folder view the default order is by file name, so albums play in track order.
+ */
+fun sortSongs(list: List<Song>, mode: Int, desc: Boolean, plays: Map<String, Int>, folderView: Boolean): List<Song> {
+    val title = Comparator<Song> { a, b -> naturalCompare(a.title, b.title) }
+    val artist = Comparator<Song> { a, b -> naturalCompare(a.artist, b.artist) }
+    val album = Comparator<Song> { a, b ->
+        val ab = a.album.isBlank()
+        val bb = b.album.isBlank()
+        if (ab != bb) (if (ab) 1 else -1) else naturalCompare(a.album, b.album)
+    }
+    val file = Comparator<Song> { a, b ->
+        naturalCompare(a.path.substringAfterLast('/'), b.path.substringAfterLast('/'), false)
+    }
+    val folder = Comparator<Song> { a, b ->
+        naturalCompare(a.path.substringBeforeLast('/', ""), b.path.substringBeforeLast('/', ""), false)
+    }
+    val cmp: Comparator<Song>? = when (mode) {
+        1 -> title.then(artist)
+        2 -> artist.then(album).then(title)
+        3 -> Comparator<Song> { a, b -> a.durationMs.compareTo(b.durationMs) }.then(title)
+        4 -> album.then(artist).then(title)
+        5 -> folder.then(file)
+        6 -> Comparator<Song> { a, b -> (plays[b.uri] ?: 0).compareTo(plays[a.uri] ?: 0) }.then(title)
+        7 -> Comparator<Song> { a, b -> (if (b.fav) 1 else 0).compareTo(if (a.fav) 1 else 0) }.then(title)
+        else -> if (folderView) file else null
+    }
+    val sorted = if (cmp != null) list.sortedWith(cmp) else list
+    return if (desc) sorted.reversed() else sorted
+}
+
 private val TS = Regex("""\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?]""")
 
 fun parseLrc(raw: String): List<LyricLine> {
@@ -269,6 +346,20 @@ object Library {
         }
         if (total <= 0.0) return android.graphics.Color.GRAY
         return android.graphics.Color.rgb((r / total).toInt(), (g / total).toInt(), (b / total).toInt())
+    }
+
+    // ----- play counts (for "Most played") -----
+    fun loadPlays(ctx: Context): Map<String, Int> = try {
+        val o = JSONObject(prefs(ctx).getString("plays", "{}"))
+        o.keys().asSequence().associateWith { o.getInt(it) }
+    } catch (e: Exception) {
+        emptyMap()
+    }
+
+    fun incPlay(ctx: Context, uri: String) {
+        val o = try { JSONObject(prefs(ctx).getString("plays", "{}")) } catch (e: Exception) { JSONObject() }
+        o.put(uri, o.optInt(uri, 0) + 1)
+        prefs(ctx).edit().putString("plays", o.toString()).apply()
     }
 
     // ----- custom wallpaper -----

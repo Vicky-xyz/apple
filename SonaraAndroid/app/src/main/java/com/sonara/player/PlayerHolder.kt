@@ -31,6 +31,7 @@ object PlayerHolder {
     private var eq: Equalizer? = null
     private var boost: BassBoost? = null
     private var eqPreset = 0
+    private var countedId: String? = null
     private var boostStrength = 0
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var appCtx: Context? = null
@@ -178,6 +179,14 @@ object PlayerHolder {
     private suspend fun volumeLoop(p: ExoPlayer) {
         while (true) {
             delay(120)
+            // a song counts as played once it has been heard for 15 seconds
+            val cur = p.currentMediaItem?.mediaId
+            if (p.currentPosition < 3_000L) {
+                countedId = null
+            } else if (cur != null && cur != countedId && p.isPlaying && p.currentPosition > 15_000L) {
+                countedId = cur
+                appCtx?.let { Library.incPlay(it, cur) }
+            }
             var v = 1f
             val fade = fadeMs
             if (fade > 0 && p.isPlaying) {

@@ -33,6 +33,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
@@ -62,6 +64,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -116,6 +119,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -157,6 +161,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -223,7 +228,7 @@ private enum class Sheet { None, Settings, Sound, Sleep, Lyrics }
 
 private fun folderOf(s: Song): String = s.path.substringBeforeLast('/', "")
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
     val ctx = LocalContext.current
@@ -258,6 +263,8 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
     var photoChanged by remember { mutableStateOf(false) }
     val draft = remember(customizing) { AppSettings(ctx, false) }
     var folders by remember { mutableStateOf(Library.loadFolders(ctx)) }
+    var plays by remember { mutableStateOf(Library.loadPlays(ctx)) }
+    var sortMenu by remember { mutableStateOf(false) }
     var sheet by remember { mutableStateOf(Sheet.None) }
     var pos by remember { mutableLongStateOf(0L) }
     var dur by remember { mutableLongStateOf(0L) }
@@ -268,11 +275,16 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
 
     val ui = remember { PlayerUi(player) }
     DisposableEffect(Unit) { onDispose { ui.dispose() } }
+    LaunchedEffect(ui.mediaId) {
+        plays = Library.loadPlays(ctx)
+        delay(17_000)
+        plays = Library.loadPlays(ctx)
+    }
 
     val current = songs.firstOrNull { it.uri == ui.mediaId }
 
     val currentPlaylist = playlists.firstOrNull { "pl:" + it.id == view }
-    val visible = remember(songs, query, view, playlists, settings.sort) {
+    val visible = remember(songs, query, view, playlists, settings.sort, settings.sortDesc, plays) {
         val byUri = songs.associateBy { it.uri }
         val base = when {
             view == "fav" -> songs.filter { it.fav }
@@ -281,19 +293,13 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                 (playlists.firstOrNull { "pl:" + it.id == view }?.uris ?: emptyList()).mapNotNull { byUri[it] }
             else -> songs
         }
-        base
-            .filter {
-                query.isBlank() || it.title.contains(query, true) || it.artist.contains(query, true) ||
-                    it.path.contains(query, true)
-            }
-            .let { l ->
-                when (settings.sort) {
-                    1 -> l.sortedBy { it.title.lowercase() }
-                    2 -> l.sortedBy { it.artist.lowercase() }
-                    3 -> l.sortedBy { it.durationMs }
-                    else -> l
-                }
-            }
+        // every word typed must match the title, artist, album or folder
+        val terms = query.trim().lowercase().split(' ').filter { it.isNotEmpty() }
+        val found = if (terms.isEmpty()) base else base.filter { sg ->
+            val hay = (sg.title + " " + sg.artist + " " + sg.album + " " + sg.path).lowercase()
+            terms.all { hay.contains(it) }
+        }
+        sortSongs(found, settings.sort, settings.sortDesc == 1, plays, view.startsWith("dir:"))
     }
 
     val folderList = remember(songs) {
@@ -376,7 +382,8 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
         }
         // Each folder is its own playlist: next / previous / shuffle stay inside the song's folder.
         val queue = if (view == "all" && settings.folderSep == 1 && item.path.isNotEmpty()) {
-            visible.filter { folderOf(it) == folderOf(item) }
+            val same = visible.filter { folderOf(it) == folderOf(item) }
+            if (settings.sort == 0) sortSongs(same, 0, settings.sortDesc == 1, plays, true) else same
         } else visible
         startQueue(queue, queue.indexOfFirst { it.uri == item.uri })
     }
@@ -654,12 +661,22 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                                     }
                                 }
                             }
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(current?.title ?: "Nothing playing", color = pal.text, fontSize = 21.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(current?.artist ?: "Add music to begin", color = pal.muted, fontSize = 14.sp)
-                                val line = lyrics.getOrNull(activeLine)?.takeIf { it.timeMs >= 0 }?.text
-                                if (!line.isNullOrBlank()) {
-                                    Text(line, color = pal.accent, fontSize = 14.sp, textAlign = TextAlign.Center, maxLines = 2, modifier = Modifier.padding(top = 6.dp))
+                            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    current?.title ?: "Nothing playing", color = pal.text, fontSize = 21.sp, fontWeight = FontWeight.Bold,
+                                    maxLines = 1, softWrap = false, textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth().basicMarquee(iterations = Int.MAX_VALUE)
+                                )
+                                Text(
+                                    current?.artist ?: "Add music to begin", color = pal.muted, fontSize = 14.sp,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                if (lyrics.isNotEmpty()) {
+                                    val line = lyrics.getOrNull(activeLine)?.takeIf { it.timeMs >= 0 }?.text ?: ""
+                                    Box(Modifier.fillMaxWidth().height(24.dp).padding(top = 4.dp), contentAlignment = Alignment.Center) {
+                                        Text(line, color = pal.accent, fontSize = 14.sp, textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
                                 }
                             }
                             VizView(settings, ui.playing, pal.accent, pal.text, pal.comp1, pal.comp2, Modifier.fillMaxWidth().height(listOf(28, 40, 64, 96)[settings.vizHeight.coerceIn(0, 3)].dp))
@@ -796,8 +813,26 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                 }
                 item {
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Chip("Sort: ${SORT_NAMES[settings.sort.coerceIn(0, 3)]}", false, pal) {
-                            settings.update("sort", (settings.sort + 1) % 4)
+                        Box {
+                            Chip("Sort: " + sortLabel(settings.sort, settings.sortDesc == 1) + "  ▾", false, pal) { sortMenu = true }
+                            DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
+                                SORT_NAMES.forEachIndexed { i, n ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(if (settings.sort == i) n + (if (settings.sortDesc == 1) "   ↓ reversed" else "   ↑") else n)
+                                        },
+                                        onClick = {
+                                            if (settings.sort == i) {
+                                                settings.update("sortdesc", 1 - settings.sortDesc)
+                                            } else {
+                                                settings.update("sort", i)
+                                                settings.update("sortdesc", 0)
+                                            }
+                                            sortMenu = false
+                                        }
+                                    )
+                                }
+                            }
                         }
                         Chip("Scan device", false, pal) { requestScan() }
                         if (view.startsWith("dir:") || currentPlaylist != null) {
@@ -1061,6 +1096,7 @@ private fun RoundIcon(icon: ImageVector, pal: Palette, onClick: () -> Unit) {
 private fun Chip(label: String, selected: Boolean, pal: Palette, onClick: () -> Unit) {
     Surface(
         onClick = onClick,
+        modifier = Modifier.widthIn(max = 220.dp),
         shape = RoundedCornerShape(50),
         color = if (selected) pal.accent else pal.panel,
         border = BorderStroke(1.dp, if (selected) pal.accent else pal.muted.copy(alpha = .3f))
@@ -1069,6 +1105,8 @@ private fun Chip(label: String, selected: Boolean, pal: Palette, onClick: () -> 
             label,
             color = if (selected) pal.onAccent else pal.text,
             fontSize = 13.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
         )
     }
@@ -1261,17 +1299,15 @@ private fun CustomizeWindow(
             contentAlignment = Alignment.Center
         ) {
             val k = minOf(maxWidth.value / 300f, maxHeight.value / 465f)
+            val baseDensity = LocalDensity.current
             Box(
                 Modifier.size((300f * k).dp, (465f * k).dp).clip(RoundedCornerShape(24.dp))
                     .border(1.dp, pal.muted.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
             ) {
-                Box(
-                    Modifier.requiredSize(300.dp, 465.dp).graphicsLayer {
-                        scaleX = k
-                        scaleY = k
-                        transformOrigin = TransformOrigin(0f, 0f)
-                    }
-                ) { PreviewScreen(d, dpal, photo, art) }
+                // the preview is designed at 300 x 465 dp; scaling the density shrinks it exactly to fit
+                CompositionLocalProvider(LocalDensity provides Density(baseDensity.density * k, baseDensity.fontScale)) {
+                    Box(Modifier.size(300.dp, 465.dp)) { PreviewScreen(d, dpal, photo, art) }
+                }
             }
         }
 
@@ -1580,8 +1616,9 @@ private fun SettingsSheet(
         )
         Label("LIBRARY SORT", pal)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            SORT_NAMES.forEachIndexed { i, n -> Chip(n, s.sort == i, pal) { s.update("sort", i) } }
+            SORT_NAMES.forEachIndexed { i, n -> Chip(n, s.sort == i, pal) { s.update("sort", i); s.update("sortdesc", 0) } }
         }
+        ChipGroup("SORT DIRECTION", listOf("Normal", "Reverse"), s.sortDesc, pal) { s.update("sortdesc", it) }
         Label("DEVICE MUSIC", pal)
         Text("Sonara finds the music on your phone automatically every time it opens and plays each file straight from its location.", color = pal.muted, fontSize = 13.sp)
         ChipGroup("PLAY EACH FOLDER SEPARATELY", listOf("Off", "On"), s.folderSep, pal) { s.update("foldersep", it) }
@@ -1612,7 +1649,7 @@ private fun SettingsSheet(
         Text("Songs found are added to your library. Removing a folder here doesn't delete its songs from the library.", color = pal.muted, fontSize = 12.sp)
         Label("HOME-SCREEN WIDGET", pal)
         Text("Long-press an empty spot on your home screen, open Widgets and add Sonara.", color = pal.muted, fontSize = 13.sp)
-        Text("Sonara 2.6", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+        Text("Sonara 2.7", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
     }
 }
 

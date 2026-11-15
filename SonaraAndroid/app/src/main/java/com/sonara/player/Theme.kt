@@ -58,7 +58,18 @@ val EQ_PRESETS = listOf(
 )
 
 val VIZ_NAMES = listOf("Bars", "Wave", "Dots", "Pulse")
-val SORT_NAMES = listOf("Recently added", "Title", "Artist", "Length")
+val SORT_NAMES = listOf("Recently added", "Title", "Artist", "Length", "Album", "Folder", "Most played", "Favorites first")
+
+fun sortLabel(mode: Int, desc: Boolean): String = when (mode) {
+    1 -> if (desc) "Title Z–A" else "Title A–Z"
+    2 -> if (desc) "Artist Z–A" else "Artist A–Z"
+    3 -> if (desc) "Longest first" else "Shortest first"
+    4 -> if (desc) "Album Z–A" else "Album A–Z"
+    5 -> if (desc) "Folder Z–A" else "Folder A–Z"
+    6 -> if (desc) "Least played" else "Most played"
+    7 -> if (desc) "Favorites last" else "Favorites first"
+    else -> if (desc) "Oldest first" else "Newest first"
+}
 
 class Palette(
     val light: Boolean,
@@ -149,6 +160,7 @@ class AppSettings(ctx: Context, private val persist: Boolean = true) {
     var bass by mutableIntStateOf(sp.getInt("bass", 0)); private set
     var fadeSec by mutableIntStateOf(sp.getInt("fade", 0)); private set
     var sort by mutableIntStateOf(sp.getInt("sort", 0)); private set
+    var sortDesc by mutableIntStateOf(sp.getInt("sortdesc", 0)); private set
     var reactive by mutableIntStateOf(sp.getInt("reactive", 0)); private set
     var minLenSec by mutableIntStateOf(sp.getInt("minlen", 30)); private set
     var vizBars by mutableIntStateOf(sp.getInt("vizbars", 32)); private set
@@ -184,6 +196,7 @@ class AppSettings(ctx: Context, private val persist: Boolean = true) {
             "bass" -> bass = v
             "fade" -> fadeSec = v
             "sort" -> sort = v
+            "sortdesc" -> sortDesc = v
             "reactive" -> reactive = v
             "minlen" -> minLenSec = v
             "vizbars" -> vizBars = v

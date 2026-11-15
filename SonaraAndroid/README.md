@@ -1,4 +1,4 @@
-# Sonara for Android (v2.6)
+# Sonara for Android (v2.7)
 
 Local music player built with Kotlin, Jetpack Compose and Media3.
 
@@ -9,6 +9,7 @@ Local music player built with Kotlin, Jetpack Compose and Media3.
 - Glass-style panels over a gradient, your own photo or the album art, with blur, dimming and transparency controls
 - Fully customizable visualizer (bars, color, sensitivity, height, width, shape, mirror)
 - Spinning disc on the playing song
+- Smart sorting: natural order (2 before 10), ignores The/A, album, folder, length, most played, favorites first, reversible; folders play in track order
 - Library saved between launches, with embedded cover art
 - Search, favorites, sorting; shuffle, repeat, playback speed
 - Sleep timer (15–90 min or end of song) with gentle fade-out
