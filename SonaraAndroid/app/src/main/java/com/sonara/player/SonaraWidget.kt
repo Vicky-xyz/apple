@@ -72,7 +72,7 @@ class SonaraWidget : AppWidgetProvider() {
             v.setImageViewResource(R.id.w_play, if (p?.isPlaying == true) R.drawable.ic_w_pause else R.drawable.ic_w_play)
 
             val sp = ctx.getSharedPreferences("sonara_settings", Context.MODE_PRIVATE)
-            val accent = ACCENTS[sp.getInt("accent", 0).coerceIn(0, ACCENTS.lastIndex)].dark.toArgb()
+            val accent = THEMES[sp.getInt("palette", 3).coerceIn(0, THEMES.lastIndex)].accent.toArgb()
             v.setInt(R.id.w_play, "setColorFilter", accent)
 
             var artSet = false

@@ -11,6 +11,7 @@ import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,7 +34,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -73,6 +78,7 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.Palette as PaletteIcon
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
@@ -108,6 +114,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -120,6 +127,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -134,7 +144,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -205,14 +217,20 @@ private enum class Sheet { None, Settings, Sound, Sleep, Lyrics }
 
 private fun folderOf(s: Song): String = s.path.substringBeforeLast('/', "")
 
-private val ON_ACCENT = Color(0xFF171426)
-
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val pal = buildPalette(settings, isSystemInDarkTheme())
+    var view by remember { mutableStateOf("all") }
+    var songColor by remember { mutableStateOf<Color?>(null) }
+    val page = when {
+        view == "fav" -> 1
+        view.startsWith("pl:") -> 2
+        view.startsWith("dir:") -> 3
+        else -> 0
+    }
+    val pal = animatedPalette(buildPalette(settings, songColor, page))
     val act = ctx as ComponentActivity
 
     LaunchedEffect(pal.light) {
@@ -223,13 +241,16 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
 
     var songs by remember { mutableStateOf(Library.load(ctx)) }
     var query by remember { mutableStateOf("") }
-    var view by remember { mutableStateOf("all") }
     var playlists by remember { mutableStateOf(Library.loadPlaylists(ctx)) }
     var nameDialog by remember { mutableStateOf<String?>(null) }
     var nameText by remember { mutableStateOf("") }
     var addTo by remember { mutableStateOf<String?>(null) }
     var scanStatus by remember { mutableStateOf("") }
     var wallImage by remember { mutableStateOf<ImageBitmap?>(null) }
+    var customizing by remember { mutableStateOf(false) }
+    var draftPhoto by remember { mutableStateOf<ImageBitmap?>(null) }
+    var photoChanged by remember { mutableStateOf(false) }
+    val draft = remember(customizing) { AppSettings(ctx, false) }
     var folders by remember { mutableStateOf(Library.loadFolders(ctx)) }
     var sheet by remember { mutableStateOf(Sheet.None) }
     var pos by remember { mutableLongStateOf(0L) }
@@ -291,10 +312,12 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
     LaunchedEffect(current?.uri) {
         art = null
         lyrics = emptyList()
-        val s = current ?: return@LaunchedEffect
+        val s = current ?: run { songColor = null; return@LaunchedEffect }
         lyrics = withContext(Dispatchers.IO) { Library.loadLyrics(ctx, s.uri) }
-        val bytes = withContext(Dispatchers.IO) { Library.art(ctx, s.uri) } ?: return@LaunchedEffect
-        art = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+        val bytes = withContext(Dispatchers.IO) { Library.art(ctx, s.uri) } ?: run { songColor = null; return@LaunchedEffect }
+        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        art = decoded?.asImageBitmap()
+        songColor = if (decoded != null) Color(withContext(Dispatchers.Default) { Library.dominantColor(decoded) }) else null
         val cur = player.currentMediaItem
         if (cur != null && cur.mediaId == s.uri && cur.mediaMetadata.artworkData == null) {
             val meta = cur.mediaMetadata.buildUpon()
@@ -396,11 +419,28 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
 
     val wallPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
-            val ok = withContext(Dispatchers.IO) { Library.saveWallpaper(ctx, uri) }
+            val ok = withContext(Dispatchers.IO) { Library.saveWallpaper(ctx, uri, "wallpaper_draft.jpg") }
             if (ok) {
-                wallImage = withContext(Dispatchers.IO) { Library.loadWallpaper(ctx) }
-                settings.update("walltype", 1)
+                draftPhoto = withContext(Dispatchers.IO) { Library.loadWallpaper(ctx, "wallpaper_draft.jpg") }
+                photoChanged = true
+                draft.update("walltype", 1)
             }
+        }
+    }
+
+    LaunchedEffect(customizing) {
+        if (customizing) {
+            photoChanged = false
+            draftPhoto = wallImage ?: withContext(Dispatchers.IO) { Library.loadWallpaper(ctx) }
+        }
+    }
+
+    fun applyCustomize() {
+        scope.launch {
+            if (photoChanged) withContext(Dispatchers.IO) { Library.promoteDraftWallpaper(ctx) }
+            if (draftPhoto != null) wallImage = draftPhoto
+            settings.applyFrom(draft)
+            customizing = false
         }
     }
 
@@ -490,22 +530,25 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
     }
 
     val navBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val listState = rememberLazyListState()
+    val scrollShade = remember {
+        derivedStateOf {
+            if (listState.firstVisibleItemIndex > 0) 1f
+            else (listState.firstVisibleItemScrollOffset / 500f).coerceIn(0f, 1f)
+        }
+    }
     val spin = rememberInfiniteTransition(label = "spin").animateFloat(
         0f, 360f, infiniteRepeatable(tween(3600, easing = LinearEasing)), label = "spinAngle"
     )
     val activeLine = remember(pos, lyrics) { lyrics.indexOfLast { it.timeMs in 0..pos } }
 
     MaterialTheme(colorScheme = if (pal.light) lightColorScheme() else darkColorScheme()) {
-        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(pal.top, pal.bg, pal.bg)))) {
-            val wp: ImageBitmap? = when (settings.wallType) { 1 -> wallImage; 2 -> art; else -> null }
-            if (wp != null) {
-                Image(
-                    wp, null,
-                    Modifier.fillMaxSize().then(if (settings.wallBlur > 0) Modifier.blur(settings.wallBlur.dp) else Modifier),
-                    contentScale = ContentScale.Crop
-                )
-                Box(Modifier.fillMaxSize().background((if (pal.light) Color.White else Color.Black).copy(alpha = settings.wallDim / 100f)))
+        Box(
+            Modifier.fillMaxSize().drawBehind {
+                drawRect(Brush.verticalGradient(listOf(lerp(pal.top, pal.bg, scrollShade.value), pal.bg, pal.bg)))
             }
+        ) {
+            WallpaperLayer(settings, pal, wallImage, art)
             val transition = rememberInfiniteTransition(label = "ambient")
             val glow by transition.animateFloat(
                 initialValue = 0.78f, targetValue = 1.12f,
@@ -513,12 +556,17 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                 label = "glow"
             )
             Box(
-                Modifier.offset(210.dp, (-95).dp).size(260.dp).scale(glow).blur(70.dp)
-                    .background(pal.accent.copy(alpha = .22f), CircleShape)
+                Modifier.offset(150.dp, (-120).dp).size(340.dp).scale(glow)
+                    .background(Brush.radialGradient(listOf(pal.glow.copy(alpha = 0.38f), Color.Transparent)), CircleShape)
+            )
+            Box(
+                Modifier.align(Alignment.BottomStart).offset((-120).dp, 120.dp).size(320.dp).scale(glow)
+                    .background(Brush.radialGradient(listOf(pal.glow2.copy(alpha = 0.32f), Color.Transparent)), CircleShape)
             )
 
             LazyColumn(
                 Modifier.fillMaxSize().statusBarsPadding(),
+                state = listState,
                 contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 24.dp + navBottom),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
@@ -528,8 +576,8 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                             Text("SONARA", color = pal.accent, fontSize = 12.sp, letterSpacing = 4.sp, fontWeight = FontWeight.Bold)
                             Text("Your sound, your space.", color = pal.text, fontSize = 23.sp, fontWeight = FontWeight.Bold)
                         }
-                        RoundIcon(if (pal.light) Icons.Default.LightMode else Icons.Default.DarkMode, pal) {
-                            settings.update("theme", if (pal.light) 0 else 1)
+                        RoundIcon(Icons.Default.PaletteIcon, pal) {
+                            settings.update("palette", (settings.palette + 1) % THEMES.size)
                         }
                         Spacer(Modifier.width(8.dp))
                         RoundIcon(Icons.Default.Settings, pal) { sheet = Sheet.Settings }
@@ -585,7 +633,7 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                                     Text(line, color = pal.accent, fontSize = 14.sp, textAlign = TextAlign.Center, maxLines = 2, modifier = Modifier.padding(top = 6.dp))
                                 }
                             }
-                            VizView(settings, ui.playing, pal.accent, pal.text, Modifier.fillMaxWidth().height(listOf(28, 40, 64, 96)[settings.vizHeight.coerceIn(0, 3)].dp))
+                            VizView(settings, ui.playing, pal.accent, pal.text, pal.comp1, pal.comp2, Modifier.fillMaxWidth().height(listOf(28, 40, 64, 96)[settings.vizHeight.coerceIn(0, 3)].dp))
                         }
                     }
                 }
@@ -623,7 +671,7 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                                     } else if (player.isPlaying) player.pause()
                                     else { player.play(); ensureService() }
                                 }) {
-                                    Icon(if (ui.playing) Icons.Default.Pause else Icons.Default.PlayArrow, null, tint = ON_ACCENT, modifier = Modifier.padding(17.dp).size(30.dp))
+                                    Icon(if (ui.playing) Icons.Default.Pause else Icons.Default.PlayArrow, null, tint = pal.onAccent, modifier = Modifier.padding(17.dp).size(30.dp))
                                 }
                                 IconButton(onClick = { if (player.mediaItemCount > 0) player.seekToNext() }) {
                                     Icon(Icons.Default.SkipNext, null, tint = pal.text, modifier = Modifier.size(32.dp))
@@ -783,7 +831,7 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                             Text(song.artist + extra, color = pal.muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         IconButton(onClick = { persist(songs.map { if (it.uri == song.uri) it.copy(fav = !it.fav) else it }) }) {
-                            Icon(if (song.fav) Icons.Default.Favorite else Icons.Default.FavoriteBorder, null, tint = if (song.fav) pal.accent else pal.muted)
+                            Icon(if (song.fav) Icons.Default.Favorite else Icons.Default.FavoriteBorder, null, tint = if (song.fav) pal.comp2 else pal.muted)
                         }
                         Box {
                             IconButton(onClick = { menuFor = song.uri }) { Icon(Icons.Default.MoreVert, null, tint = pal.muted) }
@@ -800,6 +848,22 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                         }
                     }
                 }
+            }
+
+            Box(
+                Modifier.align(Alignment.TopCenter).fillMaxWidth().height(80.dp)
+                    .graphicsLayer { alpha = scrollShade.value }
+                    .background(Brush.verticalGradient(listOf(Color.Black.copy(alpha = if (pal.light) 0.16f else 0.5f), Color.Transparent)))
+            )
+
+            if (customizing) {
+                BackHandler { customizing = false }
+                CustomizeWindow(
+                    d = draft, pal = pal, songColor = songColor, art = art, photo = draftPhoto,
+                    onPickPhoto = { wallPicker.launch(arrayOf("image/*")) },
+                    onApply = { applyCustomize() },
+                    onCancel = { customizing = false }
+                )
             }
 
             val nd = nameDialog
@@ -883,11 +947,7 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
                             onReactive = { setReactive(it) },
                             onScanDevice = { requestScan() },
                             onRestoreHidden = { Library.saveHidden(ctx, emptySet()); requestScan() },
-                            onWallType = { t ->
-                                if (t == 1 && wallImage == null) wallPicker.launch(arrayOf("image/*"))
-                                else settings.update("walltype", t)
-                            },
-                            onPickWallpaper = { wallPicker.launch(arrayOf("image/*")) }
+                            onCustomize = { sheet = Sheet.None; customizing = true }
                         )
                         Sheet.Sound -> SoundSheet(settings, pal, ui, player)
                         Sheet.Sleep -> SleepSheet(pal)
@@ -910,7 +970,10 @@ fun SonaraApp(settings: AppSettings, player: ExoPlayer) {
 @Composable
 private fun GlassCard(pal: Palette, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     Surface(
-        modifier,
+        modifier.shadow(
+            14.dp, RoundedCornerShape(28.dp),
+            ambientColor = pal.glow.copy(alpha = 0.5f), spotColor = pal.glow.copy(alpha = 0.7f)
+        ),
         shape = RoundedCornerShape(28.dp),
         color = pal.panel,
         tonalElevation = 0.dp,
@@ -963,7 +1026,7 @@ private fun Chip(label: String, selected: Boolean, pal: Palette, onClick: () -> 
     ) {
         Text(
             label,
-            color = if (selected) ON_ACCENT else pal.text,
+            color = if (selected) pal.onAccent else pal.text,
             fontSize = 13.sp,
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
         )
@@ -1002,18 +1065,246 @@ private fun ChipGroup(title: String, options: List<String>, selected: Int, pal: 
 }
 
 @Composable
-private fun SettingSlider(title: String, value: Int, max: Int, pal: Palette, onChange: (Int) -> Unit) {
+private fun ThemeChip(t: AppTheme, selected: Boolean, pal: Palette, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        color = t.bg,
+        border = BorderStroke(if (selected) 2.dp else 1.dp, if (selected) pal.accent else pal.muted.copy(alpha = 0.35f))
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf(t.surface, t.accent, t.accent2, t.comp1, t.comp2).forEach { c ->
+                    Box(Modifier.size(18.dp).clip(CircleShape).background(c).border(0.5.dp, t.text.copy(alpha = 0.25f), CircleShape))
+                }
+            }
+            Text(t.name, color = t.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun SettingSlider(title: String, value: Int, max: Int, pal: Palette, min: Int = 0, onChange: (Int) -> Unit) {
     Label(title, pal)
     Slider(
-        value = value.toFloat(), onValueChange = { onChange(it.toInt()) }, valueRange = 0f..max.toFloat(),
+        value = value.toFloat(), onValueChange = { onChange(it.toInt()) }, valueRange = min.toFloat()..max.toFloat(),
         colors = SliderDefaults.colors(
             thumbColor = pal.accent, activeTrackColor = pal.accent, inactiveTrackColor = pal.muted.copy(alpha = .3f)
         )
     )
 }
 
+/** Wallpaper image (photo or album art) with zoom, position, blur and dimming. */
 @Composable
-private fun VizView(s: AppSettings, playing: Boolean, color: Color, alt: Color, modifier: Modifier) {
+private fun WallpaperLayer(s: AppSettings, pal: Palette, photo: ImageBitmap?, art: ImageBitmap?) {
+    val wp = when (s.wallType) { 1 -> photo; 2 -> art; else -> null }
+    if (wp != null) {
+        Box(Modifier.fillMaxSize().clipToBounds()) {
+            Image(
+                wp, null,
+                Modifier.fillMaxSize()
+                    .graphicsLayer {
+                        val z = if (s.wallType == 1) s.wallZoom / 100f else 1f
+                        scaleX = z
+                        scaleY = z
+                        translationX = (s.wallX - 50) / 50f * size.width * (z - 1f) / 2f
+                        translationY = (s.wallY - 50) / 50f * size.height * (z - 1f) / 2f
+                    }
+                    .then(if (s.wallBlur > 0) Modifier.blur(s.wallBlur.dp) else Modifier),
+                contentScale = ContentScale.Crop
+            )
+            Box(Modifier.fillMaxSize().background((if (pal.light) Color.White else Color.Black).copy(alpha = s.wallDim / 100f)))
+        }
+    }
+}
+
+@Composable
+private fun WallTile(label: String, selected: Boolean, pal: Palette, onClick: () -> Unit, content: @Composable BoxScope.() -> Unit) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.clip(RoundedCornerShape(14.dp)).clickable(onClick = onClick)
+    ) {
+        Box(
+            Modifier.size(72.dp, 100.dp).clip(RoundedCornerShape(14.dp))
+                .border(if (selected) 2.dp else 1.dp, if (selected) pal.accent else pal.muted.copy(alpha = 0.35f), RoundedCornerShape(14.dp)),
+            content = content
+        )
+        Text(label, color = if (selected) pal.accent else pal.muted, fontSize = 11.sp, maxLines = 1)
+    }
+}
+
+/** A miniature copy of the main screen (designed at 300 x 465 dp) used for live previews. */
+@Composable
+private fun PreviewScreen(d: AppSettings, p: Palette, photo: ImageBitmap?, art: ImageBitmap?) {
+    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(p.top, p.bg, p.bg)))) {
+        WallpaperLayer(d, p, photo, art)
+        Box(
+            Modifier.offset(110.dp, (-100).dp).size(300.dp)
+                .background(Brush.radialGradient(listOf(p.glow.copy(alpha = 0.38f), Color.Transparent)), CircleShape)
+        )
+        Box(
+            Modifier.align(Alignment.BottomStart).offset((-100).dp, 100.dp).size(280.dp)
+                .background(Brush.radialGradient(listOf(p.glow2.copy(alpha = 0.32f), Color.Transparent)), CircleShape)
+        )
+        Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column {
+                Text("SONARA", color = p.accent, fontSize = 11.sp, letterSpacing = 3.sp, fontWeight = FontWeight.Bold)
+                Text("Your sound, your space.", color = p.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            }
+            GlassCard(p, Modifier.fillMaxWidth()) {
+                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    VinylIcon(p.accent, p.text, Modifier.size(48.dp))
+                    Text("Midnight Drive", color = p.text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Local audio", color = p.muted, fontSize = 12.sp)
+                    VizView(d, true, p.accent, p.text, p.comp1, p.comp2, Modifier.fillMaxWidth().height(listOf(28, 40, 64, 96)[d.vizHeight.coerceIn(0, 3)].dp))
+                }
+            }
+            GlassCard(p, Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.SkipPrevious, null, tint = p.text)
+                    Box(Modifier.size(40.dp).clip(CircleShape).background(p.accent), contentAlignment = Alignment.Center) {
+                        Icon(Icons.Default.PlayArrow, null, tint = p.onAccent)
+                    }
+                    Icon(Icons.Default.SkipNext, null, tint = p.text)
+                    Icon(Icons.Default.Favorite, null, tint = p.comp2)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(p.panel).padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                VinylIcon(p.accent, p.text, Modifier.size(26.dp))
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text("Neon Rain", color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Local audio · Music", color = p.muted, fontSize = 11.sp)
+                }
+            }
+        }
+    }
+}
+
+/** Full-screen appearance window. Everything is edited on a draft and only saved when Apply is tapped. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CustomizeWindow(
+    d: AppSettings,
+    pal: Palette,
+    songColor: Color?,
+    art: ImageBitmap?,
+    photo: ImageBitmap?,
+    onPickPhoto: () -> Unit,
+    onApply: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val dpal = buildPalette(d, songColor)
+    var previewSize by remember { mutableIntStateOf(1) }
+    val maxW = LocalConfiguration.current.screenWidthDp.dp - 40.dp
+    val pw = maxW * listOf(0.5f, 0.72f, 1f)[previewSize]
+    val ph = pw * 1.55f
+    val k = pw.value / 300f
+    val theme = THEMES[d.palette.coerceIn(0, THEMES.lastIndex)]
+
+    Column(
+        Modifier.fillMaxSize().background(pal.bg)
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }
+            .statusBarsPadding()
+    ) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onCancel) { Text("Cancel", color = pal.muted) }
+            Text("Customize", color = pal.text, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
+            Button(onClick = onApply, colors = ButtonDefaults.buttonColors(containerColor = pal.accent, contentColor = pal.onAccent)) {
+                Text("Apply")
+            }
+        }
+        Column(
+            Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)
+                .navigationBarsPadding().padding(bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text("Changes show in the preview and are saved only when you tap Apply. Cancel or Back throws them away.", color = pal.muted, fontSize = 12.sp)
+            ChipGroup("PREVIEW SIZE", listOf("Small", "Medium", "Large"), previewSize, pal) { previewSize = it }
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Box(
+                    Modifier.size(pw, ph).clip(RoundedCornerShape(28.dp))
+                        .border(1.dp, pal.muted.copy(alpha = 0.4f), RoundedCornerShape(28.dp))
+                ) {
+                    Box(
+                        Modifier.requiredSize(300.dp, 465.dp).graphicsLayer {
+                            scaleX = k
+                            scaleY = k
+                            transformOrigin = TransformOrigin(0f, 0f)
+                        }
+                    ) { PreviewScreen(d, dpal, photo, art) }
+                }
+            }
+
+            Label("THEME  ·  LIGHT", pal)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                THEMES.forEachIndexed { i, t -> if (t.light) ThemeChip(t, d.palette == i, pal) { d.update("palette", i) } }
+            }
+            Label("THEME  ·  DARK", pal)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                THEMES.forEachIndexed { i, t -> if (!t.light) ThemeChip(t, d.palette == i, pal) { d.update("palette", i) } }
+            }
+
+            Label("WALLPAPER", pal)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                WallTile("Gradient", d.wallType == 0, pal, { d.update("walltype", 0) }) {
+                    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(lerp(theme.bg, wallTint(theme, d.wallpaper), 0.65f), theme.bg))))
+                }
+                WallTile("My photo", d.wallType == 1, pal, { if (photo == null) onPickPhoto() else d.update("walltype", 1) }) {
+                    if (photo != null) Image(photo, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    else Text("+", color = pal.muted, fontSize = 28.sp, modifier = Modifier.align(Alignment.Center))
+                }
+                WallTile("Album art", d.wallType == 2, pal, { d.update("walltype", 2) }) {
+                    if (art != null) Image(art, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    else Text("plays a song first", color = pal.muted, fontSize = 10.sp, textAlign = TextAlign.Center, modifier = Modifier.align(Alignment.Center).padding(4.dp))
+                }
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Chip("Choose photo…", false, pal, onPickPhoto) }
+
+            Label("GRADIENT STYLE", pal)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                WALLS.forEachIndexed { i, w ->
+                    WallTile(w.name, d.wallpaper == i, pal, { d.update("wallpaper", i); d.update("walltype", 0) }) {
+                        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(lerp(theme.bg, wallTint(theme, i), 0.65f), theme.bg))))
+                    }
+                }
+            }
+
+            if (d.wallType == 1) {
+                SettingSlider("PHOTO ZOOM  ${d.wallZoom}%", d.wallZoom, 300, pal, min = 100) { d.update("wallzoom", it) }
+                SettingSlider("PHOTO POSITION  ·  LEFT / RIGHT", d.wallX, 100, pal) { d.update("wallx", it) }
+                SettingSlider("PHOTO POSITION  ·  UP / DOWN", d.wallY, 100, pal) { d.update("wally", it) }
+            }
+            SettingSlider("WALLPAPER BLUR  ${d.wallBlur}", d.wallBlur, 30, pal) { d.update("wallblur", it) }
+            Text("Blur needs Android 12 or newer.", color = pal.muted, fontSize = 12.sp)
+            SettingSlider("WALLPAPER DIMMING  ${d.wallDim}%", d.wallDim, 80, pal) { d.update("walldim", it) }
+            SettingSlider("GLASS TRANSPARENCY  ${d.glass}%", d.glass, 100, pal) { d.update("glass", it) }
+
+            ChipGroup("SONG-COLORED SHADOW AND GLOW", listOf("Off", "On"), d.songGlow, pal) { d.update("songglow", it) }
+            ChipGroup("ACCENT FOLLOWS THE SONG", listOf("Off", "On"), d.dynAccent, pal) { d.update("dynaccent", it) }
+            ChipGroup("PAGE COLOR SHIFT (favorites, playlists, folders)", listOf("Off", "On"), d.pageTint, pal) { d.update("pagetint", it) }
+            ChipGroup("SPINNING DISC ON THE PLAYING SONG", listOf("Off", "On"), d.spin, pal) { d.update("spin", it) }
+
+            ChipGroup("VISUALIZER STYLE", VIZ_NAMES, d.visualizer, pal) { d.update("visualizer", it) }
+            ChipGroup("BARS", listOf("16", "24", "32", "48"), listOf(16, 24, 32, 48).indexOf(d.vizBars).coerceAtLeast(0), pal) {
+                d.update("vizbars", listOf(16, 24, 32, 48)[it])
+            }
+            ChipGroup("COLOR", listOf("Accent", "Palette mix", "Neutral", "Gradient"), d.vizColor, pal) { d.update("vizcolor", it) }
+            ChipGroup("SENSITIVITY", listOf("Low", "Medium", "High"), d.vizSens, pal) { d.update("vizsens", it) }
+            ChipGroup("HEIGHT", listOf("Compact", "Normal", "Tall", "Big"), d.vizHeight, pal) { d.update("vizheight", it) }
+            ChipGroup("BAR WIDTH", listOf("Thin", "Normal", "Thick"), d.vizThick, pal) { d.update("vizthick", it) }
+            ChipGroup("BAR SHAPE", listOf("Rounded", "Square"), d.vizShape, pal) { d.update("vizshape", it) }
+            ChipGroup("MIRROR (bass in the middle)", listOf("Off", "On"), d.vizMirror, pal) { d.update("vizmirror", it) }
+        }
+    }
+}
+
+@Composable
+private fun VizView(s: AppSettings, playing: Boolean, color: Color, alt: Color, c1: Color, c2: Color, modifier: Modifier) {
     val t = rememberInfiniteTransition(label = "viz")
     val phase by t.animateFloat(
         0f, (2 * Math.PI).toFloat(),
@@ -1036,9 +1327,14 @@ private fun VizView(s: AppSettings, playing: Boolean, color: Color, alt: Color, 
             return (raw * sens).coerceIn(0f, 1f)
         }
         fun colorAt(i: Int, cnt: Int): Color = when (s.vizColor) {
-            1 -> Color.hsv(((i.toFloat() / cnt) * 300f + phase * 20f) % 360f, 0.55f, 1f)
+            1 -> {
+                val stops = listOf(color, c1, c2, color)
+                val pos = (i.toFloat() / cnt) * 3f
+                val k = pos.toInt().coerceIn(0, 2)
+                lerp(stops[k], stops[k + 1], pos - k)
+            }
             2 -> alt
-            3 -> lerp(color, alt, i.toFloat() / cnt)
+            3 -> lerp(color, c1, i.toFloat() / cnt)
             else -> color
         }
         when (style) {
@@ -1133,45 +1429,12 @@ private fun SettingsSheet(
     onReactive: (Boolean) -> Unit,
     onScanDevice: () -> Unit,
     onRestoreHidden: () -> Unit,
-    onWallType: (Int) -> Unit,
-    onPickWallpaper: () -> Unit,
+    onCustomize: () -> Unit,
 ) {
     SheetBody {
-        Text("Appearance", color = pal.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Label("THEME", pal)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            THEME_NAMES.forEachIndexed { i, n -> Chip(n, s.theme == i, pal) { s.update("theme", i) } }
-        }
-        Label("ACCENT COLOR", pal)
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            ACCENTS.forEachIndexed { i, a ->
-                val c = if (pal.light) a.light else a.dark
-                Box(
-                    Modifier.size(34.dp).clip(CircleShape).background(c)
-                        .clickable { s.update("accent", i) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (s.accent == i) Box(Modifier.size(12.dp).clip(CircleShape).background(ON_ACCENT))
-                }
-            }
-        }
-        ChipGroup("WALLPAPER", listOf("Gradient", "My photo", "Album art"), s.wallType, pal) { onWallType(it) }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Chip("Choose photo…", false, pal, onPickWallpaper)
-        }
-        SettingSlider("GLASS TRANSPARENCY  ${s.glass}%", s.glass, 100, pal) { s.update("glass", it) }
-        SettingSlider("WALLPAPER BLUR  ${s.wallBlur}", s.wallBlur, 30, pal) { s.update("wallblur", it) }
-        SettingSlider("WALLPAPER DIMMING  ${s.wallDim}%", s.wallDim, 80, pal) { s.update("walldim", it) }
-        Text("Blur needs Android 12 or newer. Dimming keeps text readable on bright photos.", color = pal.muted, fontSize = 12.sp)
-        ChipGroup("SPINNING DISC ON THE PLAYING SONG", listOf("Off", "On"), s.spin, pal) { s.update("spin", it) }
-        Label("GRADIENT COLORS", pal)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            WALLS.forEachIndexed { i, w -> Chip(w.name, s.wallpaper == i, pal) { s.update("wallpaper", i) } }
-        }
-        Label("VISUALIZER STYLE", pal)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            VIZ_NAMES.forEachIndexed { i, n -> Chip(n, s.visualizer == i, pal) { s.update("visualizer", i) } }
-        }
+        Text("Settings", color = pal.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Chip("Customize appearance…", false, pal, onCustomize)
+        Text("Themes, wallpaper, glass, shadows and the visualizer have their own window, so a stray touch can't change them.", color = pal.muted, fontSize = 12.sp)
         Label("AUDIO-REACTIVE", pal)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Chip("On", s.reactive == 1, pal) { onReactive(true) }
@@ -1181,17 +1444,6 @@ private fun SettingsSheet(
             "Makes the visualizer move with the music. Android asks for the microphone permission for this, but Sonara only reads its own playback and never records or stores audio.",
             color = pal.muted, fontSize = 12.sp
         )
-        Label("VISUALIZER PREVIEW", pal)
-        VizView(s, true, pal.accent, pal.text, Modifier.fillMaxWidth().height(listOf(28, 40, 64, 96)[s.vizHeight.coerceIn(0, 3)].dp))
-        ChipGroup("BARS", listOf("16", "24", "32", "48"), listOf(16, 24, 32, 48).indexOf(s.vizBars).coerceAtLeast(0), pal) {
-            s.update("vizbars", listOf(16, 24, 32, 48)[it])
-        }
-        ChipGroup("COLOR", listOf("Accent", "Rainbow", "Neutral", "Gradient"), s.vizColor, pal) { s.update("vizcolor", it) }
-        ChipGroup("SENSITIVITY", listOf("Low", "Medium", "High"), s.vizSens, pal) { s.update("vizsens", it) }
-        ChipGroup("HEIGHT", listOf("Compact", "Normal", "Tall", "Big"), s.vizHeight, pal) { s.update("vizheight", it) }
-        ChipGroup("BAR WIDTH", listOf("Thin", "Normal", "Thick"), s.vizThick, pal) { s.update("vizthick", it) }
-        ChipGroup("BAR SHAPE", listOf("Rounded", "Square"), s.vizShape, pal) { s.update("vizshape", it) }
-        ChipGroup("MIRROR (bass in the middle)", listOf("Off", "On"), s.vizMirror, pal) { s.update("vizmirror", it) }
         Label("LIBRARY SORT", pal)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SORT_NAMES.forEachIndexed { i, n -> Chip(n, s.sort == i, pal) { s.update("sort", i) } }
@@ -1226,7 +1478,7 @@ private fun SettingsSheet(
         Text("Songs found are added to your library. Removing a folder here doesn't delete its songs from the library.", color = pal.muted, fontSize = 12.sp)
         Label("HOME-SCREEN WIDGET", pal)
         Text("Long-press an empty spot on your home screen, open Widgets and add Sonara.", color = pal.muted, fontSize = 13.sp)
-        Text("Sonara 2.3", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+        Text("Sonara 2.5", color = pal.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
     }
 }
 
@@ -1304,7 +1556,7 @@ private fun SleepSheet(pal: Palette) {
         }
         Button(
             onClick = { PlayerHolder.cancelSleep() },
-            colors = ButtonDefaults.buttonColors(containerColor = pal.accent, contentColor = ON_ACCENT)
+            colors = ButtonDefaults.buttonColors(containerColor = pal.accent, contentColor = pal.onAccent)
         ) { Text("Turn off timer") }
         Text("Volume fades out gently before playback stops.", color = pal.muted, fontSize = 12.sp)
     }
@@ -1332,7 +1584,7 @@ private fun LyricsSheet(
             Text("Play a song first, then add its .lrc lyrics file.", color = pal.muted)
         } else if (lyrics.isEmpty()) {
             Text("No lyrics for this song yet. Pick a .lrc file (synced) or a .txt file (plain).", color = pal.muted)
-            Button(onClick = onLoad, colors = ButtonDefaults.buttonColors(containerColor = pal.accent, contentColor = ON_ACCENT)) {
+            Button(onClick = onLoad, colors = ButtonDefaults.buttonColors(containerColor = pal.accent, contentColor = pal.onAccent)) {
                 Text("Load lyrics file")
             }
         } else {

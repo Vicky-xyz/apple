@@ -246,8 +246,31 @@ object Library {
         prefs(ctx).edit().putString("hidden", JSONArray(hidden.toList()).toString()).apply()
     }
 
+    /** Average color of an image, weighted toward vivid pixels (used to tint the glow). */
+    fun dominantColor(bmp: Bitmap): Int {
+        val small = Bitmap.createScaledBitmap(bmp, 24, 24, true)
+        var r = 0.0
+        var g = 0.0
+        var b = 0.0
+        var total = 0.0
+        val hsv = FloatArray(3)
+        for (y in 0 until 24) {
+            for (x in 0 until 24) {
+                val px = small.getPixel(x, y)
+                android.graphics.Color.colorToHSV(px, hsv)
+                val w = 0.05 + hsv[1] * hsv[2]
+                r += android.graphics.Color.red(px) * w
+                g += android.graphics.Color.green(px) * w
+                b += android.graphics.Color.blue(px) * w
+                total += w
+            }
+        }
+        if (total <= 0.0) return android.graphics.Color.GRAY
+        return android.graphics.Color.rgb((r / total).toInt(), (g / total).toInt(), (b / total).toInt())
+    }
+
     // ----- custom wallpaper -----
-    fun saveWallpaper(ctx: Context, uri: Uri): Boolean {
+    fun saveWallpaper(ctx: Context, uri: Uri, name: String = "wallpaper.jpg"): Boolean {
         try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
@@ -256,17 +279,22 @@ object Library {
             val opts = BitmapFactory.Options().apply { inSampleSize = sample }
             val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
                 ?: return false
-            File(ctx.filesDir, "wallpaper.jpg").outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+            File(ctx.filesDir, name).outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 88, it) }
             return true
         } catch (e: Throwable) {
             return false
         }
     }
 
-    fun loadWallpaper(ctx: Context): ImageBitmap? {
-        val f = File(ctx.filesDir, "wallpaper.jpg")
+    fun loadWallpaper(ctx: Context, name: String = "wallpaper.jpg"): ImageBitmap? {
+        val f = File(ctx.filesDir, name)
         if (!f.exists()) return null
         return try { BitmapFactory.decodeFile(f.path)?.asImageBitmap() } catch (e: Throwable) { null }
+    }
+
+    fun promoteDraftWallpaper(ctx: Context) {
+        val d = File(ctx.filesDir, "wallpaper_draft.jpg")
+        if (d.exists()) d.copyTo(File(ctx.filesDir, "wallpaper.jpg"), overwrite = true)
     }
 
     // ----- playlists -----
